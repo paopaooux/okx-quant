@@ -1,0 +1,22 @@
+services:
+  okx-demo-sync:
+    build: .
+    image: okx-quant:demo
+    restart: unless-stopped
+    # Linux: this lets the container use the host Clash listener at 127.0.0.1:7890.
+    # On Docker Desktop, use host.docker.internal instead.
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      OKX_PROXY_URL: ${OKX_PROXY_URL:-http://127.0.0.1:7890}
+      OKX_DEMO_DB: /app/data/okx_demo.sqlite3
+      OKX_SYNC_INTERVAL: ${OKX_SYNC_INTERVAL:-60}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.live.okx_demo", "--check"]
+      interval: 5m
+      timeout: 30s
+      retries: 3
+      start_period: 20s

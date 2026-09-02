@@ -1,0 +1,14 @@
+[Unit]
+Description=OKX Quant simulated account synchronizer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/okx-quant
+EnvironmentFile=/opt/okx-quant/.env
+ExecStart=/opt/okx-quant/.venv/bin/python -m scripts.live.okx_demo
+User=okx-quant
+
+[Install]
+WantedBy=multi-user.target
