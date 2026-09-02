@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.egg-info/
+*.py[cod]
+data/okx_demo.sqlite3
+data/okx_demo.sqlite3-*
+
+# Research outputs and local artifacts are not part of the deployable demo.
+*.log
+data/*
+!data/.gitkeep
+cache/
+models/
+results/
