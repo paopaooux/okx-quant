@@ -13,9 +13,6 @@ import requests
 
 BASE = "https://www.okx.com"
 DB_PATH = Path(os.environ.get("OKX_DEMO_DB", Path(__file__).resolve().parents[2] / "data" / "okx_demo.sqlite3"))
-SIMULATED_TRADING = os.environ.get("OKX_SIMULATED_TRADING", "1").strip().lower() not in {
-    "0", "false", "no", "off"
-}
 
 
 def load_dotenv() -> None:
@@ -36,6 +33,9 @@ def load_dotenv() -> None:
 
 load_dotenv()
 DB_PATH = Path(os.environ.get("OKX_DEMO_DB", DB_PATH))
+SIMULATED_TRADING = os.environ.get("OKX_SIMULATED_TRADING", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 
 
 def db_connect():
