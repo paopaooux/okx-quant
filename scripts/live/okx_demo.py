@@ -64,11 +64,22 @@ def db_connect():
       sub_type TEXT, inst_id TEXT, currency TEXT, amount TEXT,
       balance TEXT, raw_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS strategy_snapshots (
+      id INTEGER PRIMARY KEY, ts TEXT NOT NULL, cycle_id TEXT NOT NULL,
+      symbol TEXT NOT NULL, strategy TEXT, asset_type TEXT, bar_ts INTEGER, signal_side TEXT, p_up REAL,
+      signal_close REAL, ticker_px REAL, ticker_ts INTEGER,
+      position_side TEXT, position_size TEXT, entry_px REAL, width REAL,
+      stop_px REAL, take_px REAL, total_eq TEXT, raw_json TEXT NOT NULL
+    );
     """)
     # Keep databases created by earlier demo versions usable.
     columns = {row[1] for row in db.execute("PRAGMA table_info(balance_snapshots)")}
     if "total_eq" not in columns:
         db.execute("ALTER TABLE balance_snapshots ADD COLUMN total_eq TEXT")
+    snapshot_columns = {row[1] for row in db.execute("PRAGMA table_info(strategy_snapshots)")}
+    for name, ddl in (("strategy", "TEXT"), ("asset_type", "TEXT")):
+        if name not in snapshot_columns:
+            db.execute(f"ALTER TABLE strategy_snapshots ADD COLUMN {name} {ddl}")
     return db
 
 
@@ -105,6 +116,19 @@ def save_account_data(positions, fills, bills):
                   b.get("ccy"), b.get("balChg"), b.get("bal"), json.dumps(b, ensure_ascii=True)))
 
 
+def save_strategy_snapshots(rows):
+    """Persist one row per symbol and cycle for fine-grained paper-trading analysis."""
+    if not rows:
+        return
+    with db_connect() as db:
+        db.executemany("""INSERT INTO strategy_snapshots
+          (ts,cycle_id,symbol,strategy,asset_type,bar_ts,signal_side,p_up,signal_close,ticker_px,ticker_ts,
+           position_side,position_size,entry_px,width,stop_px,take_px,total_eq,raw_json)
+          VALUES (:ts,:cycle_id,:symbol,:strategy,:asset_type,:bar_ts,:signal_side,:p_up,:signal_close,:ticker_px,
+                  :ticker_ts,:position_side,:position_size,:entry_px,:width,:stop_px,:take_px,
+                  :total_eq,:raw_json)""", rows)
+
+
 def print_stats():
     with db_connect() as db:
         row = db.execute("""SELECT COUNT(*) orders,
@@ -122,10 +146,14 @@ def print_stats():
             SUM(CASE WHEN side='buy' THEN CAST(fill_sz AS REAL) ELSE -CAST(fill_sz AS REAL) END) net_sz
             FROM orders WHERE state IN ('filled','partially_filled') GROUP BY inst_id
             HAVING ABS(net_sz) > 1e-12 ORDER BY inst_id""").fetchall()
+        snap = db.execute("""SELECT COUNT(*) count, MIN(ts) first_ts, MAX(ts) last_ts,
+            COUNT(DISTINCT cycle_id) cycles FROM strategy_snapshots""").fetchone()
         print(f"database: {DB_PATH}")
         print(f"orders: {row['orders']}  filled volume: {row['volume']:.8g}")
         print(f"realized pnl: {row['pnl']:.8f} USDT  fees: {row['fees']:.8f} USDT")
         print(f"fills: {fill_row['count']}  fill volume: {fill_row['volume']:.8g}  funding: {bill_row['funding']:.8f}  bill fees: {bill_row['fees']:.8f}")
+        print(f"strategy snapshots: {snap['count']} rows / {snap['cycles']} cycles  "
+              f"({snap['first_ts'] or 'n/a'} -> {snap['last_ts'] or 'n/a'})")
         if len(equity) >= 2:
             initial, latest = float(equity[0][0]), float(equity[-1][0])
             roi = (latest / initial - 1.0) * 100 if initial else 0.0
@@ -194,8 +222,8 @@ class DemoClient:
                 time.sleep(0.3)
         return detail
 
-    def positions(self):
-        return self._request("GET", "/api/v5/account/positions", params={"instType": "SWAP"})
+    def positions(self, inst_type="SWAP"):
+        return self._request("GET", "/api/v5/account/positions", params={"instType": inst_type})
 
     def fills(self):
         return self._request("GET", "/api/v5/trade/fills", params={"instType": "SWAP", "limit": "100"})

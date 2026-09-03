@@ -9,8 +9,12 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 usage() {
     cat <<'EOF'
 用法:
-  ./run.sh              增量更新数据并回测 b/c 的 tail 0.01/0.02 四格
+  ./run.sh              运行股票 + crypto 组合回测（默认）
+  ./run.sh combinations 运行股票 + crypto 组合回测
+  ./run.sh crypto      更新数据并训练/回测 crypto
+  ./run.sh stocks      运行当前项目内的股票策略回测
   ./run.sh check        检查 OKX 模拟盘连接
+  ./run.sh combo        combinations 的兼容别名
   ./run.sh help         显示帮助
 EOF
 }
@@ -34,13 +38,19 @@ run_backtest() {
     "$PYTHON_BIN" -u -m scripts.backtest.report
 }
 
-case "${1:-all}" in
-    all)
+case "${1:-combinations}" in
+    crypto)
         build_data
         run_backtest
         ;;
     check)
         exec "$ROOT/scripts/run_quant.sh" --check
+        ;;
+    stocks|stock)
+        exec "$PYTHON_BIN" -u scripts/stocks/run_strategy.py
+        ;;
+    combinations|combo|all)
+        exec "$PYTHON_BIN" -u -m scripts.combinations.run
         ;;
     help|-h|--help)
         usage

@@ -1,22 +1,58 @@
+name: okx-quant
+
 services:
-  okx-demo-sync:
-    build: .
+  backtest:
+    build:
+      context: .
+      # Linux builds can use the host's local Clash listener for package
+      # downloads.  This affects build networking only.
+      network: host
+      args:
+        HTTP_PROXY: ${DOCKER_HTTP_PROXY:-http://127.0.0.1:7890}
+        HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-http://127.0.0.1:7890}
+    image: okx-quant:backtest
+    restart: "no"
+    network_mode: host
+    volumes:
+      # The pre-backtest Binance tail updater needs to append confirmed rows.
+      - ./data:/app/data
+      - ./models:/app/models:ro
+      - ./results:/app/results
+    environment:
+      BINANCE_PROXY_URL: ${OKX_PROXY_URL:-http://127.0.0.1:7890}
+    command: ["sh", "-c", "python scripts/data/update_binance_tail.py && python -m scripts.combinations.run"]
+
+  okx-quant:
+    build:
+      context: .
+      network: host
+      args:
+        HTTP_PROXY: ${DOCKER_HTTP_PROXY:-http://127.0.0.1:7890}
+        HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-http://127.0.0.1:7890}
     image: okx-quant:demo
+    container_name: okx-quant
     restart: unless-stopped
-    # Linux: this lets the container use the host Clash listener at 127.0.0.1:7890.
-    # On Docker Desktop, use host.docker.internal instead.
     network_mode: host
     env_file:
       - .env
     environment:
-      OKX_PROXY_URL: ${OKX_PROXY_URL:-http://127.0.0.1:7890}
+      AUTO_TRADE: "true"
+      AUTO_CONFIG: "c"
+      AUTO_TAIL: "0.01"
+      AUTO_MAX_POSITIONS: "2"
+      AUTO_INTERVAL: "30"
+      AUTO_MAX_HOLD_BARS: "48"
       OKX_DEMO_DB: /app/data/okx_demo.sqlite3
-      OKX_SYNC_INTERVAL: ${OKX_SYNC_INTERVAL:-60}
+      AUTO_STOCK_DATA: /app/data/stocks
+      STOCK_SEC_INTERVAL: "60"
+      STOCK_CANDLE_INTERVAL: "300"
+      STOCK_HISTORY_DAYS: "4"
+      SEC_LOOKBACK_DAYS: "30"
+      SEC_USER_AGENT: ${SEC_USER_AGENT:-okx-quant research contact@example.com}
+      OKX_CRYPTO_START: "2026-09-01"
+      OKX_CRYPTO_INTERVAL: "60"
     volumes:
       - ./data:/app/data
-    healthcheck:
-      test: ["CMD", "python", "-m", "scripts.live.okx_demo", "--check"]
-      interval: 5m
-      timeout: 30s
-      retries: 3
-      start_period: 20s
+      - ./models:/app/models:ro
+      - ./results:/app/results:ro
+    command: ["python", "scripts/live/run_all.py"]
