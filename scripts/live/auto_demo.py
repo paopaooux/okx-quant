@@ -203,6 +203,24 @@ def remote_positions(client: DemoClient) -> dict[str, dict]:
     return out
 
 
+def stock_short_available(client: DemoClient, inst_id: str) -> bool:
+    """Check the account's live borrow capacity before opening a stock short."""
+    try:
+        rows = client.max_loan(inst_id, mgn_ccy="USDT", mgn_mode="cross")
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        print(f"stock short check failed {inst_id}: {exc}", flush=True)
+        return False
+    sell = next((row for row in rows if row.get("side") == "sell"), {})
+    try:
+        available = float(sell.get("maxLoan") or 0.0)
+    except (TypeError, ValueError):
+        available = 0.0
+    if available <= 0:
+        print(f"stock short skipped {inst_id}: account maxLoan(sell)={sell.get('maxLoan', '0')}", flush=True)
+        return False
+    return True
+
+
 def build_crypto_signals(data: LiveData) -> dict[str, dict]:
     raw_k, raw_m, frames = {}, {}, {}
     for sym in SYMBOLS:
@@ -397,8 +415,14 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
             max_bars = MAX_HOLD_BARS if sig.get("asset_type") == "crypto" else int(STOCK_MAX_HOLD_HOURS * 4)
             if allow_orders and (hit or bars >= max_bars):
                 side = "sell" if pos["side"] == "long" else "buy"
-                td_mode = "isolated" if pos.get("asset_type", sig.get("asset_type")) == "crypto" else "cross"
-                client.order(inst, side, pos.get("size", SIZE), td_mode, True)
+                asset_type = pos.get("asset_type", sig.get("asset_type"))
+                td_mode = "isolated" if asset_type == "crypto" else (
+                    "cross" if pos["side"] == "short" else "cash"
+                )
+                quick_mgn_type = None
+                if asset_type == "stock" and pos["side"] == "short":
+                    quick_mgn_type = "auto_repay" if pos["side"] == "short" else None
+                client.order(inst, side, pos.get("size", SIZE), td_mode, True, quick_mgn_type)
                 state["positions"].pop(sym, None)
                 state["trades"] = int(state.get("trades", 0)) + 1
                 print(f"EXIT {sym} strategy={pos.get('strategy', sig.get('strategy'))} side={pos['side']} mark={mark:.8g} bars={bars} hit={hit}", flush=True)
@@ -409,7 +433,13 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
             side = "buy" if sig["side"] == "long" else "sell"
             size = SIZE if sig.get("asset_type") == "crypto" else STOCK_SIZE
             td_mode = "isolated" if sig.get("asset_type") == "crypto" else "cash"
-            result = client.order(inst, side, size, td_mode, False)
+            quick_mgn_type = None
+            if sig.get("asset_type") == "stock":
+                if sig["side"] == "short" and not stock_short_available(client, inst):
+                    continue
+                td_mode = "cross"
+                quick_mgn_type = "auto_borrow" if sig["side"] == "short" else None
+            result = client.order(inst, side, size, td_mode, False, quick_mgn_type)
             ord_id = result[0].get("ordId") if result else ""
             detail = client.order_detail(inst, ord_id) if ord_id else {}
             if detail.get("state") == "filled":

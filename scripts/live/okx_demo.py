@@ -234,9 +234,19 @@ class DemoClient:
     def instruments(self):
         return self._request("GET", "/api/v5/public/instruments", params={"instType": "SWAP"})
 
-    def order(self, inst_id, side, sz, td_mode="isolated", reduce_only=False):
+    def max_loan(self, inst_id, mgn_ccy="USDT", mgn_mode="cross"):
+        """Return the account's current spot-margin borrow limits."""
+        return self._request("GET", "/api/v5/account/max-loan", params={
+            "instType": "MARGIN", "instId": inst_id,
+            "mgnMode": mgn_mode, "mgnCcy": mgn_ccy,
+        })
+
+    def order(self, inst_id, side, sz, td_mode="isolated", reduce_only=False,
+              quick_mgn_type=None):
         body = {"instId": inst_id, "tdMode": td_mode, "side": side, "ordType": "market", "sz": str(sz)}
         if reduce_only: body["reduceOnly"] = "true"
+        if quick_mgn_type:
+            body["quickMgnType"] = quick_mgn_type
         return self._request("POST", "/api/v5/trade/order", body=body)
 
 def main():

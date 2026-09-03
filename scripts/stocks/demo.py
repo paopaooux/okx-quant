@@ -49,7 +49,22 @@ def main() -> int:
         }
         if args.inst_id not in allowed:
             parser.error("--inst-id 必须是 OKX USDT 代币化股票（instCategory=3）")
-        result = client.order(args.inst_id, args.side, args.sz, td_mode="cash")
+        if args.side == "sell":
+            try:
+                loans = client.max_loan(args.inst_id, mgn_ccy="USDT", mgn_mode="cross")
+            except RuntimeError as exc:
+                parser.error(f"查询空头借币额度失败: {exc}")
+            sell = next((row for row in loans if row.get("side") == "sell"), {})
+            try:
+                available = float(sell.get("maxLoan") or 0.0)
+            except (TypeError, ValueError):
+                available = 0.0
+            if available <= 0:
+                parser.error(f"{args.inst_id} 当前账号没有可用空头借币额度（maxLoan={sell.get('maxLoan', '0')}）")
+            result = client.order(args.inst_id, args.side, args.sz,
+                                  td_mode="cross", quick_mgn_type="auto_borrow")
+        else:
+            result = client.order(args.inst_id, args.side, args.sz, td_mode="cash")
         print(result)
     return 0
 
