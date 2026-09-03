@@ -93,7 +93,7 @@ def load(cfg: str):
     """OOS scores + raw OHLC, shared by every (tp, sl) cell.  Split out of main so
     other modules (report tables) can build the same trade list without re-running
     the whole grid."""
-    oos = pd.read_csv(ROOT / "results" / f"oos_dir_{cfg}.csv.gz")
+    oos = pd.read_csv(ROOT / "results" / "crypto" / f"oos_dir_{cfg}.csv.gz")
     oos["dt"] = pd.to_datetime(oos["dt"], utc=True)
     px = {}
     for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
@@ -172,7 +172,7 @@ def main() -> None:
     pol = sys.argv[3] if len(sys.argv) > 3 else "both"
     H = dict((n, h) for n, _, h in build.CONFIGS)[cfg]
 
-    oos = pd.read_csv(ROOT / "results" / f"oos_dir_{cfg}.csv.gz")
+    oos = pd.read_csv(ROOT / "results" / "crypto" / f"oos_dir_{cfg}.csv.gz")
     oos["dt"] = pd.to_datetime(oos["dt"], utc=True)
     yrs = (oos.dt.max() - oos.dt.min()).total_seconds() / (365.25 * 86400)
 
@@ -202,7 +202,7 @@ def main() -> None:
               f"| {sr.get('winrate', float('nan')):>8.1%} {sr.get('net_bps', float('nan')):>+8.1f}")
         rows.append({"tp": tp_m, "sl": sl_m, **sm,
                      **{f"pf_{k}": v for k, v in pf.items()}})
-    pd.DataFrame(rows).to_csv(ROOT / "results" / f"asym_{cfg}_{tail}_{pol}.csv", index=False)
+    pd.DataFrame(rows).to_csv(ROOT / "results" / "crypto" / f"asym_{cfg}_{tail}_{pol}.csv", index=False)
 
 
 if __name__ == "__main__":

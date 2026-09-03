@@ -23,7 +23,7 @@ import pandas as pd
 
 from scripts.backtest.backtest import summarise, COSTS_BPS
 
-RESULTS = Path(__file__).resolve().parents[2] / "results"
+RESULTS = Path(__file__).resolve().parents[2] / "results" / "crypto"
 ALL_TAILS = (0.10, 0.05, 0.02, 0.01, 0.005, 0.001)
 
 

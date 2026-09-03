@@ -30,7 +30,7 @@ tail = float(sys.argv[3]) if len(sys.argv) > 3 else 0.01
 pol = sys.argv[4] if len(sys.argv) > 4 else "short"
 COST = 10.0
 
-oos = pd.read_csv(ROOT / "results" / f"oos_dir_{tag}.csv.gz")
+oos = pd.read_csv(ROOT / "results" / "crypto" / f"oos_dir_{tag}.csv.gz")
 oos["dt"] = pd.to_datetime(oos["dt"], utc=True)
 years = (oos.dt.max() - oos.dt.min()).total_seconds() / (365.25 * 86400)
 

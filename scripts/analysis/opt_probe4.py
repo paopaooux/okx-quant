@@ -17,7 +17,7 @@ from pathlib import Path
 from scripts.analysis.opt_probe import load_bars, score, show, SYMS
 
 ROOT = Path(__file__).resolve().parents[2]
-RES = ROOT / "results"
+RES = ROOT / "results" / "crypto"
 COST = 10.0
 
 

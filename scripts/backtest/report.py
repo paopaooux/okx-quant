@@ -23,7 +23,7 @@ from scripts.backtest import portfolio
 from scripts.backtest.backtest import summarise
 
 ROOT = Path(__file__).resolve().parents[2]
-RESULTS = ROOT / "results"
+RESULTS = ROOT / "results" / "crypto"
 SPLIT = pd.Timestamp("2024-11-01", tz="UTC")   # start of the 3-year study's OOS
 # The operational comparison set.  Keep the lower-level backtest capable of
 # scanning every tail, but make the default report answer the live decision.
@@ -48,7 +48,7 @@ strategy_files = [Path(__file__), ROOT / "scripts" / "backtest" / "backtest_dir.
                   ROOT / "scripts" / "modeling" / "train.py",
                   ROOT / "scripts" / "modeling" / "train_dir.py"]
 strategy_fingerprint = file_fingerprint(strategy_files)
-input_files = [ROOT / "results" / f"oos_dir_{cfg}.csv.gz"
+input_files = [RESULTS / f"oos_dir_{cfg}.csv.gz"
                for cfg in sorted({c for c, _, _ in CELLS})]
 data_fingerprint = file_fingerprint(input_files)
 run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -63,7 +63,7 @@ RUN_DIR.mkdir(parents=True, exist_ok=False)
 
 oos = {}
 for cfg in sorted({c for c, _, _ in CELLS}):
-    o = pd.read_csv(ROOT / "results" / f"oos_dir_{cfg}.csv.gz")
+    o = pd.read_csv(RESULTS / f"oos_dir_{cfg}.csv.gz")
     o["dt"] = pd.to_datetime(o["dt"], utc=True)
     oos[cfg] = o
 yrs = {c: (o.dt.max() - o.dt.min()).total_seconds() / (365.25 * 86400)
@@ -171,4 +171,4 @@ for name in ("report_long.csv", "report_stability.csv", "report_meta.json"):
     target.write_bytes((RUN_DIR / name).read_bytes())
     (RESULTS / name).write_bytes((RUN_DIR / name).read_bytes())
 print(f"\nrun_id: {run_id}")
-print(f"已写入 results/runs/{run_id}/，并更新 results/latest/（根目录 report_* 为兼容快捷副本）")
+print(f"已写入 results/crypto/runs/{run_id}/，并更新 results/crypto/latest/")

@@ -133,9 +133,14 @@ def rsi(close: pd.Series, w: int = 14) -> pd.Series:
     return 100 - 100 / (1 + up / dn.replace(0.0, np.nan))
 
 
-def build_symbol(sym: str, btc_ret: pd.Series | None, limit: int | None = None) -> pd.DataFrame:
-    k = pd.read_csv(DATA / "klines" / f"{sym}.csv.gz")
-    m = pd.read_csv(DATA / "metrics" / f"{sym}.csv.gz")
+def build_symbol(sym: str, btc_ret: pd.Series | None, limit: int | None = None,
+                 klines_df: pd.DataFrame | None = None,
+                 metrics_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Build features from local archives or caller-provided live frames."""
+    k = (klines_df.copy() if klines_df is not None else
+         pd.read_csv(DATA / "klines" / f"{sym}.csv.gz"))
+    m = (metrics_df.copy() if metrics_df is not None else
+         pd.read_csv(DATA / "metrics" / f"{sym}.csv.gz"))
 
     df = k.merge(m, on="ts", how="left").sort_values("ts").reset_index(drop=True)
     if limit is not None:                 # used by selftest.py to prove no lookahead

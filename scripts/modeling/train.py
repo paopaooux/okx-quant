@@ -35,7 +35,7 @@ from scripts.data import build
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 MODELS = ROOT / "models"
-RESULTS = ROOT / "results"
+RESULTS = ROOT / "results" / "crypto"
 
 N_FOLDS = 6
 TRAIN_FRAC = 0.40           # first 40% of history is train-only, never scored
@@ -158,7 +158,7 @@ def run(config: str) -> None:
               f"trees L{rec['iters_long'].iloc[0]}/S{rec['iters_short'].iloc[0]}", flush=True)
 
     oos = pd.concat(oos, ignore_index=True)
-    RESULTS.mkdir(exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
     oos.to_csv(RESULTS / f"oos_{config}.csv.gz", index=False, compression="gzip")
 
     reports = []

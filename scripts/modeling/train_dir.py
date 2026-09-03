@@ -31,7 +31,7 @@ from scripts.data import build
 from scripts.modeling.train import PARAMS, feature_columns, folds, BAR_MS, TRAIN_FRAC, N_FOLDS
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA, RESULTS, MODELS = ROOT / "data", ROOT / "results", ROOT / "models"
+DATA, RESULTS, MODELS = ROOT / "data", ROOT / "results" / "crypto", ROOT / "models"
 # Cuts are two-tailed: the high tail is a long, the low tail is a short.
 TAILS = (0.10, 0.05, 0.02, 0.01, 0.005, 0.001)
 
@@ -114,7 +114,7 @@ def run(config: str, drop_session: bool, price_source: str = "binance",
               f"trees {m.best_iteration_:>4}  valid AUC {auc:.4f}", flush=True)
 
     oos = pd.concat(oos, ignore_index=True)
-    RESULTS.mkdir(exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
     oos.to_csv(RESULTS / f"oos_dir_{tag}.csv.gz", index=False, compression="gzip")
 
     # The decomposition that killed version one, repeated here.  A directional

@@ -21,7 +21,7 @@ from pathlib import Path
 from scripts.backtest.backtest_dir import simulate
 
 ROOT = Path(__file__).resolve().parents[2]
-RES = ROOT / "results"
+RES = ROOT / "results" / "crypto"
 SYMS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 BAR_MS = 15 * 60 * 1000
 BARS_Y = 365 * 96

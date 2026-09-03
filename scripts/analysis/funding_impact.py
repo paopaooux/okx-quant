@@ -42,7 +42,7 @@ def funding_bps(sym: str, ts: int, held: float, side: int) -> float:
 def main() -> None:
     rng = np.random.default_rng(11)
     for tag, cfg, tl in CELLS:
-        oos = pd.read_csv(F.parent.parent / "results" / f"oos_dir_{tag}.csv.gz")
+        oos = pd.read_csv(F.parent.parent / "results" / "crypto" / f"oos_dir_{tag}.csv.gz")
         for pol in ("long", "short"):
             tr = bd.simulate(oos, cfg, tl, pol, 0.0, "model", rng)
             if tr.empty:

@@ -27,7 +27,7 @@ import pandas as pd
 from scripts.data import build
 
 ROOT = Path(__file__).resolve().parents[2]
-RESULTS = ROOT / "results"
+RESULTS = ROOT / "results" / "crypto"
 QUANTILES = (0.90, 0.95, 0.98, 0.99, 0.995, 0.999)
 COSTS_BPS = (10.0, 16.0)          # base and pessimistic round trip
 BARS_PER_YEAR = 365 * 24 * 4

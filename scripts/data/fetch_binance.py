@@ -51,10 +51,25 @@ KLINE_COLS = ["open_time", "open", "high", "low", "close", "volume", "close_time
 
 
 def fetch(url: str, retries: int = 4) -> bytes | None:
-    """Download with a disk cache.  Returns None on a hard 404 (missing day)."""
+    """Download with a disk cache.
+
+    A daily Binance archive can return 404 for several hours before it is
+    published. Do not permanently negative-cache that response: otherwise a
+    later refresh can never repair the newest one or two days of the archive.
+    """
     key = CACHE / url.rsplit("/", 1)[-1]
     if key.exists():
-        return key.read_bytes() or None
+        if key.stat().st_size:
+            return key.read_bytes()
+        # Empty files are legacy negative-cache entries. Retry them after a
+        # short cooldown so historical missing files do not cause request
+        # storms while newly published daily files are eventually picked up.
+        if time.time() - key.stat().st_mtime < 6 * 3600:
+            return None
+        try:
+            key.unlink()
+        except OSError:
+            return None
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=UA)
@@ -64,7 +79,6 @@ def fetch(url: str, retries: int = 4) -> bytes | None:
             return blob
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                key.write_bytes(b"")   # negative-cache: don't re-ask for a gap
                 return None
             time.sleep(1.5 * (attempt + 1))
         except Exception:

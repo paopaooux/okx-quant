@@ -34,7 +34,7 @@ COST = 10.0
 MIN_TRADES = 20
 
 ROOT = Path(__file__).resolve().parents[2]
-oos = {tag: pd.read_csv(ROOT / "results" / f"oos_dir_{tag}.csv.gz") for _, tag in PANELS}
+oos = {tag: pd.read_csv(ROOT / "results" / "crypto" / f"oos_dir_{tag}.csv.gz") for _, tag in PANELS}
 for tag in oos:
     oos[tag]["dt"] = pd.to_datetime(oos[tag]["dt"], utc=True)
 years = {tag: (o.dt.max() - o.dt.min()).total_seconds() / (365.25 * 86400)

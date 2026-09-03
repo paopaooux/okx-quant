@@ -15,7 +15,7 @@ from pathlib import Path
 from scripts.backtest.backtest_dir import simulate
 from scripts.analysis.opt_probe import load_bars, bar_returns, occupancy, score, show, SYMS
 
-RES = Path(__file__).resolve().parents[2] / "results"
+RES = Path(__file__).resolve().parents[2] / "results" / "crypto"
 TARGET_VOL = 0.242
 
 
