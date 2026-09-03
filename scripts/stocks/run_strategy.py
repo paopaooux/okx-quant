@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,7 +99,7 @@ def _write_reports(
         "sample_end_utc": str(events.accepted.max()) if not events.empty else None,
         "event_count": int(len(events)),
         "trade_count": int(len(trades)),
-        "universe": "technology stocks, executable shorts only",
+        "universe": f"{os.environ.get('STOCK_POOL', 'tech').lower()} stocks, executable shorts only",
         "bar": "5m",
         "normal_route": {"observe_minutes": 90, "min_move_bps": 50, "item_202": False},
         "earnings_route": {"observe_minutes": 45, "min_move_bps": 0, "item_202": True},
@@ -166,15 +167,35 @@ def main() -> int:
         # The migrated project stores them under data/stocks, but accepting the
         # old layout keeps STOCK_ALPHA_ROOT useful as a data override.
         input_dir = result_dir
+    universe = pd.read_csv(input_dir / "universe.csv")
     filings = pd.read_csv(input_dir / "sec_filings_raw.csv")
-    filings["accepted"] = pd.to_datetime(filings.accepted, utc=True, errors="coerce")
-    filings = filings.loc[
-        filings.accepted >= pd.Timestamp("2026-07-16", tz="UTC")
-    ].drop_duplicates("accession")
+    filings["accepted"] = pd.to_datetime(
+        filings.accepted, utc=True, errors="coerce", format="mixed"
+    )
+    filings = filings.dropna(subset=["accepted"]).drop_duplicates("accession")
     filings = filings.loc[filings.form.astype(str).str.startswith("8-K")]
+    fallback_start = pd.Timestamp(
+        os.environ.get("STOCK_STRATEGY_START", "2026-07-16"), tz="UTC"
+    )
+    if {"ticker", "list_ts"}.issubset(universe.columns):
+        listed = pd.to_datetime(
+            universe.set_index("ticker")["list_ts"], utc=True, errors="coerce"
+        )
+        min_start = filings["ticker"].map(listed) + pd.Timedelta(
+            hours=cfg.listing_burn_in_hours
+        )
+        filings = filings.loc[filings.accepted >= min_start.fillna(fallback_start)]
+    else:
+        filings = filings.loc[filings.accepted >= fallback_start]
+    pool_filter = os.environ.get("STOCK_POOL", "tech").lower()
+    if pool_filter not in {"tech", "all"}:
+        raise ValueError("STOCK_POOL must be tech or all")
+    eligible_tickers = set(universe.ticker.astype(str)) if pool_filter == "all" else TECH
+    side_filter = os.environ.get("STOCK_SIDE", "both").lower()
+    if side_filter not in {"both", "long", "short"}:
+        raise ValueError("STOCK_SIDE must be both, long, or short")
     inst_ids = sorted(filings.instId.dropna().unique())
     frames = data.to_bar_end(data.load_panel(inst_ids, "5m", cfg.data_dir), "5m")
-    universe = pd.read_csv(input_dir / "universe.csv")
     # 两条线使用不同的观察窗口，但最终在同一个组合回测里共享仓位限制。
     normal = news_strategy.build_events(
         filings, frames, observe_minutes=90, min_move_bps=50,
@@ -189,13 +210,19 @@ def main() -> int:
 
     def select(events: pd.DataFrame, is_earnings: bool) -> pd.DataFrame:
         events = events.loc[
-            events.ticker.isin(TECH) & events.executable
+            events.ticker.isin(eligible_tickers) & events.executable
         ].copy()
         has_202 = events["items"].astype(str).str.contains("2.02")
         return events.loc[has_202 if is_earnings else ~has_202]
 
     normal = select(normal, False)
     earnings = select(earnings, True)
+    if side_filter == "long":
+        normal = normal.loc[normal.side > 0].copy()
+        earnings = earnings.loc[earnings.side > 0].copy()
+    elif side_filter == "short":
+        normal = normal.loc[normal.side < 0].copy()
+        earnings = earnings.loc[earnings.side < 0].copy()
     normal["strategy"] = "normal"
     earnings["strategy"] = "earnings_2.02"
     events = pd.concat([normal, earnings], ignore_index=True).sort_values("event_ts")
