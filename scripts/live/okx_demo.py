@@ -13,6 +13,9 @@ import requests
 
 BASE = "https://www.okx.com"
 DB_PATH = Path(os.environ.get("OKX_DEMO_DB", Path(__file__).resolve().parents[2] / "data" / "okx_demo.sqlite3"))
+SIMULATED_TRADING = os.environ.get("OKX_SIMULATED_TRADING", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 
 
 def load_dotenv() -> None:
@@ -192,8 +195,9 @@ class DemoClient:
         msg = ts + method.upper() + request_path + body_text
         sign = base64.b64encode(hmac.new(self.secret.encode(), msg.encode(), hashlib.sha256).digest()).decode()
         headers = {"OK-ACCESS-KEY": self.key, "OK-ACCESS-SIGN": sign,
-                   "OK-ACCESS-TIMESTAMP": ts, "OK-ACCESS-PASSPHRASE": self.passphrase,
-                   "x-simulated-trading": "1"}
+                   "OK-ACCESS-TIMESTAMP": ts, "OK-ACCESS-PASSPHRASE": self.passphrase}
+        if SIMULATED_TRADING:
+            headers["x-simulated-trading"] = "1"
         # Pass the already-encoded query in the URL so it is byte-for-byte the
         # same path that was signed above.
         r = self.s.request(method, BASE + request_path, data=body_text, headers=headers, timeout=15)
@@ -267,7 +271,8 @@ def main():
         missing = [name for name, value in (("--inst-id", args.inst_id), ("--side", args.side), ("--sz", args.sz)) if not value]
         if missing:
             ap.error("--trade requires " + ", ".join(missing))
-        print("WARNING: --trade will place OKX DEMO orders only (x-simulated-trading=1).")
+        venue = "OKX DEMO" if SIMULATED_TRADING else "OKX LIVE"
+        print(f"WARNING: --trade will place {venue} orders.")
     try:
         c = DemoClient()
     except RuntimeError as exc:

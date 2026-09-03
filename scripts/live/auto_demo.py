@@ -21,7 +21,7 @@ import pandas as pd
 import requests
 
 from scripts.data import build
-from scripts.live.okx_demo import BASE, DemoClient, save_balance, save_strategy_snapshots
+from scripts.live.okx_demo import BASE, SIMULATED_TRADING, DemoClient, save_balance, save_strategy_snapshots
 from strategies.stocks.market import data as stock_data
 from strategies.stocks.market.universe_tech import TECH
 from strategies.stocks.research import news_strategy
@@ -498,7 +498,7 @@ def main() -> None:
     allow = os.environ.get("AUTO_TRADE", "false").lower() in {"1", "true", "yes", "on"} and not args.observe
     print(f"auto demo config={CONFIG} tail={TAIL} allow_orders={allow} interval={INTERVAL}s "
           f"max_positions={MAX_POSITIONS} max_data_age={MAX_DATA_AGE}s "
-          "price_source=OKX metrics_source=OKX simulated_header=1", flush=True)
+          f"price_source=OKX metrics_source=OKX simulated_header={int(SIMULATED_TRADING)}", flush=True)
     while True:
         try:
             run_once(client, state, allow)
