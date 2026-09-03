@@ -5,12 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "okx-quant"
 version = "0.1.0"
-description = "OKX simulated perpetual trading ledger and reporting tool"
+description = "Crypto, tokenized-stock, and cross-strategy backtesting tool"
 requires-python = ">=3.10"
 dependencies = ["requests>=2.31,<3"]
 
 [project.scripts]
-okx-quant = "scripts.live.okx_demo:main"
+okx-quant = "scripts.combinations.run:main"
+okx-stock-strategy = "scripts.run_stock_strategy:main"
 
 [tool.setuptools.packages.find]
-include = ["scripts*"]
+include = ["scripts*", "strategies*"]
