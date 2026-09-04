@@ -28,7 +28,8 @@ ALL_TAILS = (0.10, 0.05, 0.02, 0.01, 0.005, 0.001)
 
 
 def simulate(df: pd.DataFrame, cfg: str, tail: float, policy: str,
-             cost_bps: float, variant: str, rng: np.random.Generator) -> pd.DataFrame:
+             cost_bps: float, variant: str, rng: np.random.Generator,
+             separate_sides: bool = False) -> pd.DataFrame:
     """Trade-level P&L.
 
     Thresholds are taken PER ROW from the row's own fold (`hi_{tail}` / `lo_{tail}`
@@ -62,17 +63,25 @@ def simulate(df: pd.DataFrame, cfg: str, tail: float, policy: str,
         want_l &= ~both
         want_s &= ~both
 
-        free_at = 0
+        # Conservative legacy mode allows one position per underlying.  The
+        # side-sleeve mode treats (symbol, long) and (symbol, short) as two
+        # independent opportunities, as in a hedge-mode perpetual account.
+        free_at = {1: 0, -1: 0} if separate_sides else {0: 0}
         for i in range(len(g)):
-            if i < free_at or not np.isfinite(held[i]) or not np.isfinite(exret[i]):
+            if not np.isfinite(held[i]) or not np.isfinite(exret[i]):
+                continue
+            if "eligible" in g and not bool(g["eligible"].iloc[i]):
                 continue
             side = 1 if want_l[i] else (-1 if want_s[i] else 0)
             if not side:
                 continue
+            key = side if separate_sides else 0
+            if i < free_at[key]:
+                continue
             gross = side * exret[i]
             out.append((sym, g["ts"].iloc[i], g["dt"].iloc[i], side,
                         gross, gross - cost_bps / 1e4, held[i]))
-            free_at = i + int(held[i]) + 1
+            free_at[key] = i + int(held[i]) + 1
     return pd.DataFrame(out, columns=["symbol", "ts", "dt", "side", "gross", "net", "held"])
 
 

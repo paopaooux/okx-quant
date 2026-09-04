@@ -30,7 +30,14 @@ import pandas as pd
 
 BASE = "https://data.binance.vision/data/futures/um"
 UA = {"User-Agent": "Mozilla/5.0"}
-SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+DEFAULT_SYMBOLS = (
+    "ADAUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT",
+    "ETHUSDT", "LINKUSDT", "SOLUSDT", "XRPUSDT",
+)
+# Keep the original three-symbol default, while allowing a research run to
+# widen the universe without editing source.  Example: --symbols=BNBUSDT,XRPUSDT.
+_symbols_arg = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--symbols=")), None)
+SYMBOLS = tuple(s.strip().upper() for s in _symbols_arg.split(",") if s.strip()) if _symbols_arg else DEFAULT_SYMBOLS
 # 2021-01 is the earliest month with daily `metrics` zips for all three symbols
 # (checked by HEAD: 2021-01-01 through 2023-06-01 all return 200).  The original
 # 2023-09 start was chosen for convenience and it cost the study its regime

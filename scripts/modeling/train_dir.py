@@ -37,7 +37,10 @@ TAILS = (0.10, 0.05, 0.02, 0.01, 0.005, 0.001)
 
 
 def run(config: str, drop_session: bool, price_source: str = "binance",
-        roll_days: int | None = None) -> None:
+        roll_days: int | None = None, panel_path: str | Path | None = None,
+        dynamic_universe: bool = False, dynamic_prior_n: int = 50,
+        dynamic_min_signals: int = 20, dynamic_max_symbols: int = 6,
+        symbols: tuple[str, ...] | None = None) -> None:
     """roll_days: train on a trailing window of that many days instead of an
     expanding one.
 
@@ -52,7 +55,12 @@ def run(config: str, drop_session: bool, price_source: str = "binance",
     # "okx" swaps in labels and exits computed from OKX swap prices while the
     # features stay Binance-derived -- the venue-portability test.
     src = "panel_okx.csv.gz" if price_source == "okx" else "panel.csv.gz"
-    panel = pd.read_csv(DATA / src)
+    panel_file = Path(panel_path) if panel_path else DATA / src
+    if not panel_file.is_absolute():
+        panel_file = ROOT / panel_file
+    panel = pd.read_csv(panel_file)
+    if symbols:
+        panel = panel.loc[panel["symbol"].astype(str).isin(symbols)].copy()
     panel["dt"] = pd.to_datetime(panel["dt"], utc=True)
     panel = panel.sort_values(["ts", "symbol"]).reset_index(drop=True)
 
@@ -70,7 +78,9 @@ def run(config: str, drop_session: bool, price_source: str = "binance",
     y = lw
     tag = (f"{config}{'_nosession' if drop_session else ''}"
            f"{'_okx' if price_source == 'okx' else ''}"
-           f"{f'_roll{roll_days}' if roll_days else ''}")
+           f"{f'_roll{roll_days}' if roll_days else ''}"
+           f"{f'_u{len(symbols)}' if symbols else ''}"
+           f"{f'_dyn_prior{dynamic_prior_n}' if dynamic_universe else ''}")
     print(f"direction model  config {config}  H={H}  features={len(feats)}"
           f"{'  (hour/dow dropped)' if drop_session else ''}"
           f"{'  [OKX prices]' if price_source == 'okx' else ''}")
@@ -82,6 +92,7 @@ def run(config: str, drop_session: bool, price_source: str = "binance",
     X = panel[feats]
 
     oos = []
+    dynamic_rows = []
     for fi, (a, b) in enumerate(folds(times)):
         t_lo, t_hi = times[a], times[b - 1]
         test = (ts >= t_lo) & (ts <= t_hi)
@@ -108,6 +119,43 @@ def run(config: str, drop_session: bool, price_source: str = "binance",
         for t in TAILS:
             rec[f"hi_{t}"] = float(np.quantile(p_tr, 1 - t))
             rec[f"lo_{t}"] = float(np.quantile(p_tr, t))
+        if dynamic_universe:
+            # Universe selection is made only from the validation tail that is
+            # not used to fit the trees.  It is therefore available before the
+            # following test block and cannot inspect test outcomes.
+            p_valid = m.predict_proba(X[valid])[:, 1]
+            hi, lo = float(np.quantile(p_tr, 0.99)), float(np.quantile(p_tr, 0.01))
+            valid_rows = panel.loc[valid, ["symbol", f"exit_ret_{config}"]].copy()
+            valid_rows["p_up"] = p_valid
+            valid_rows["side"] = np.where(valid_rows.p_up >= hi, 1,
+                                           np.where(valid_rows.p_up <= lo, -1, 0))
+            valid_rows = valid_rows.loc[valid_rows.side != 0]
+            valid_rows["net"] = valid_rows.side * valid_rows[f"exit_ret_{config}"] - 10.0 / 1e4
+            quality_all = valid_rows.groupby("symbol")["net"].agg(n="count", mean_net="mean")
+            quality_all["score"] = quality_all["n"] / (quality_all["n"] + max(0, dynamic_prior_n)) * quality_all["mean_net"]
+            quality = (quality_all.query("n >= @dynamic_min_signals and score > 0")
+                       .sort_values(["score", "n"], ascending=False))
+            if len(quality) >= 3:
+                eligible = list(quality.head(dynamic_max_symbols).index.astype(str))
+            else:
+                fallback = (quality_all.query("n >= @dynamic_min_signals")
+                             .sort_values(["score", "n"], ascending=False))
+                eligible = list(fallback.head(3).index.astype(str)) or sorted(panel.loc[test, "symbol"].astype(str).unique())
+            rec["eligible"] = rec["symbol"].astype(str).isin(eligible)
+            for symbol in sorted(panel.loc[test, "symbol"].astype(str).unique()):
+                row = quality_all.loc[symbol] if symbol in quality_all.index else None
+                dynamic_rows.append({
+                    "fold": fi,
+                    "test_start": pd.to_datetime(t_lo, unit="ms", utc=True).isoformat(),
+                    "symbol": symbol,
+                    "valid_signals": int(row["n"]) if row is not None else 0,
+                    "valid_mean_net_bps": float(row["mean_net"] * 10_000) if row is not None else float("nan"),
+                    "valid_score_bps": float(row["score"] * 10_000) if row is not None else float("nan"),
+                    "valid_min_signals": dynamic_min_signals,
+                    "prior_n": dynamic_prior_n,
+                    "eligible": symbol in eligible,
+                    "eligible_symbols": ",".join(eligible),
+                })
         oos.append(rec)
         auc = m.best_score_["valid_0"]["auc"]
         print(f"  fold {fi}: fit {int(fit.sum()):,}  test {int(test.sum()):,}  "
@@ -116,6 +164,8 @@ def run(config: str, drop_session: bool, price_source: str = "binance",
     oos = pd.concat(oos, ignore_index=True)
     RESULTS.mkdir(parents=True, exist_ok=True)
     oos.to_csv(RESULTS / f"oos_dir_{tag}.csv.gz", index=False, compression="gzip")
+    if dynamic_universe:
+        pd.DataFrame(dynamic_rows).to_csv(RESULTS / f"dynamic_universe_{tag}.csv", index=False)
 
     # The decomposition that killed version one, repeated here.  A directional
     # model must move P(long win) and P(short win) in *opposite* directions; a
@@ -156,5 +206,12 @@ def run(config: str, drop_session: bool, price_source: str = "binance",
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     roll = next((int(a.split("=")[1]) for a in sys.argv if a.startswith("--roll=")), None)
+    panel = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--panel=")), None)
+    prior_n = next((int(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--dynamic-prior-n=")), 50)
+    min_signals = next((int(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--dynamic-min-signals=")), 20)
+    max_symbols = next((int(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--dynamic-max-symbols=")), 6)
+    symbols_arg = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--symbols=")), None)
+    symbols = tuple(s.strip() for s in symbols_arg.split(",") if s.strip()) if symbols_arg else None
     run(args[0] if args else "a", "--no-session" in sys.argv,
-        "okx" if "--okx" in sys.argv else "binance", roll)
+        "okx" if "--okx" in sys.argv else "binance", roll, panel,
+        "--dynamic-universe" in sys.argv, prior_n, min_signals, max_symbols, symbols)

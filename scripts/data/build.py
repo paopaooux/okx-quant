@@ -28,7 +28,13 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
-SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+DEFAULT_SYMBOLS = (
+    "ADAUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT",
+    "ETHUSDT", "LINKUSDT", "SOLUSDT", "XRPUSDT",
+)
+_symbols_arg = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--symbols=")), None)
+SYMBOLS = tuple(s.strip().upper() for s in _symbols_arg.split(",") if s.strip()) if _symbols_arg else DEFAULT_SYMBOLS
+_output_arg = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--output=")), None)
 
 # Binance USDT-M perp, VIP0: 4bps taker per side, plus ~1bp of spread/slippage
 # on majors.  Do NOT reuse the OKX-spot cost model from ../distilled_alpha --
@@ -282,7 +288,10 @@ def main() -> None:
                   f"break-even winrate {be:.1%}", flush=True)
 
     panel = pd.concat(frames, ignore_index=True).sort_values(["ts", "symbol"]).reset_index(drop=True)
-    out = DATA / "panel.csv.gz"
+    out = Path(_output_arg) if _output_arg else DATA / "panel.csv.gz"
+    if not out.is_absolute():
+        out = ROOT / out
+    out.parent.mkdir(parents=True, exist_ok=True)
     panel.to_csv(out, index=False, compression="gzip")
     print(f"\npanel: {len(panel):,} rows x {panel.shape[1]} cols -> {out}")
 

@@ -39,17 +39,22 @@ services:
       AUTO_TRADE: "true"
       AUTO_CONFIG: "c"
       AUTO_TAIL: "0.01"
-      AUTO_MAX_POSITIONS: "2"
+      AUTO_MODEL_TAG: "c_roll730"
+      AUTO_MAX_POSITIONS: "5"
+      AUTO_SLOT_WEIGHT: "0.20"
+      AUTO_DYNAMIC_SIZE: "true"
+      AUTO_DYNAMIC_SIZE_FALLBACK: "skip"
+      AUTO_POSITION_MODE: "net_mode"
       AUTO_INTERVAL: "30"
       AUTO_MAX_HOLD_BARS: "48"
       OKX_DEMO_DB: /app/data/okx_demo.sqlite3
-      AUTO_STOCK_DATA: /app/data/stocks
+      AUTO_STOCK_DATA: /app/data/stocks_swap
       STOCK_SEC_INTERVAL: "60"
       STOCK_CANDLE_INTERVAL: "300"
       STOCK_HISTORY_DAYS: "4"
       SEC_LOOKBACK_DAYS: "30"
       SEC_USER_AGENT: ${SEC_USER_AGENT:-okx-quant research contact@example.com}
-      OKX_CRYPTO_START: "2026-09-01"
+      OKX_CRYPTO_HISTORY_DAYS: "30"
       OKX_CRYPTO_INTERVAL: "60"
     volumes:
       - ./data:/app/data

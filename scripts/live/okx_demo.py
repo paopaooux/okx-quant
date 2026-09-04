@@ -229,14 +229,18 @@ class DemoClient:
     def positions(self, inst_type="SWAP"):
         return self._request("GET", "/api/v5/account/positions", params={"instType": inst_type})
 
+    def account_config(self):
+        """Return account-level position mode and margin configuration."""
+        return self._request("GET", "/api/v5/account/config")
+
     def fills(self):
         return self._request("GET", "/api/v5/trade/fills", params={"instType": "SWAP", "limit": "100"})
 
     def bills(self):
         return self._request("GET", "/api/v5/account/bills", params={"instType": "SWAP", "limit": "100"})
 
-    def instruments(self):
-        return self._request("GET", "/api/v5/public/instruments", params={"instType": "SWAP"})
+    def instruments(self, inst_type="SWAP"):
+        return self._request("GET", "/api/v5/public/instruments", params={"instType": inst_type})
 
     def max_loan(self, inst_id, mgn_ccy="USDT", mgn_mode="cross"):
         """Return the account's current spot-margin borrow limits."""
@@ -246,11 +250,13 @@ class DemoClient:
         })
 
     def order(self, inst_id, side, sz, td_mode="isolated", reduce_only=False,
-              quick_mgn_type=None):
+              quick_mgn_type=None, pos_side=None):
         body = {"instId": inst_id, "tdMode": td_mode, "side": side, "ordType": "market", "sz": str(sz)}
         if reduce_only: body["reduceOnly"] = "true"
         if quick_mgn_type:
             body["quickMgnType"] = quick_mgn_type
+        if pos_side in {"long", "short"}:
+            body["posSide"] = pos_side
         return self._request("POST", "/api/v5/trade/order", body=body)
 
 def main():
@@ -258,7 +264,7 @@ def main():
     ap.add_argument("--check", action="store_true", help="check demo balance and instrument metadata")
     ap.add_argument("--trade", action="store_true", help="place one demo market order")
     ap.add_argument("--inst-id", help="OKX instrument, e.g. BTC-USDT-SWAP")
-    ap.add_argument("--side", choices=("buy", "sell"), help="buy opens long / sell opens short in net mode")
+    ap.add_argument("--side", choices=("buy", "sell"), help="market order direction; hedge side is set by the strategy")
     ap.add_argument("--sz", help="order size in contracts (not coins)")
     ap.add_argument("--td-mode", choices=("cross", "isolated"), default="isolated")
     ap.add_argument("--reduce-only", action="store_true", help="close/reduce a net-mode position")
@@ -290,6 +296,9 @@ def main():
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         print(f"account data sync warning: {exc}")
     if args.check:
+        config = c.account_config()
+        print(f"account config: posMode={config[0].get('posMode') if config else 'unknown'} "
+              f"acctLv={config[0].get('acctLv') if config else 'unknown'}")
         rows = c.instruments()
         for x in rows:
             if x.get("instId") in {"BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"}:

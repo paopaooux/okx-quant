@@ -83,7 +83,7 @@ meta = {
     "label_source": "Binance USDT-M 15m OHLC, triple-barrier labels",
     "execution_venue_assumption": "OKX USDT perpetual (cost stress tested at 10 and 16 bps)",
     "timeframe": "15m",
-    "symbols": list(bd.SYMBOLS) if hasattr(bd, "SYMBOLS") else ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+    "symbols": sorted(set().union(*(set(o.symbol.astype(str)) for o in oos.values()))),
     "sample_start_utc": min(o.dt.min() for o in oos.values()).isoformat(),
     "sample_end_utc": max(o.dt.max() for o in oos.values()).isoformat(),
     "oos_start_utc": min(o.dt.min() for o in oos.values()).isoformat(),

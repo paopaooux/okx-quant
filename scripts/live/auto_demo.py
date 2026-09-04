@@ -13,6 +13,7 @@ import json
 import os
 import time
 import uuid
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 
 import lightgbm as lgb
@@ -28,25 +29,78 @@ from strategies.stocks.research import news_strategy
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA, RESULTS, MODELS = ROOT / "data", ROOT / "results" / "crypto", ROOT / "models"
-SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
-STOCK_FILINGS = Path(os.environ.get("AUTO_STOCK_FILINGS", DATA / "stocks" / "sec_filings_raw.csv"))
-STOCK_DATA = Path(os.environ.get("AUTO_STOCK_DATA", DATA / "stocks"))
+# Frozen production universe. Keep this order independent from the LightGBM
+# categorical codes; build_crypto_signals uses SYMBOL_CODE below.
+SYMBOLS = (
+    "ADAUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT",
+    "ETHUSDT", "LINKUSDT", "SOLUSDT", "XRPUSDT",
+)
+SYMBOL_CODE = {symbol: i for i, symbol in enumerate(SYMBOLS)}
+STOCK_DATA = Path(os.environ.get("AUTO_STOCK_DATA", DATA / "stocks_swap"))
+STOCK_FILINGS = Path(os.environ.get("AUTO_STOCK_FILINGS", STOCK_DATA / "sec_filings_raw.csv"))
 STOCK_STATUS = Path(os.environ.get("AUTO_STOCK_STATUS", STOCK_DATA / "data_status.json"))
 STOCK_DATA_MAX_AGE = max(120, int(os.environ.get("STOCK_DATA_MAX_AGE", "900")))
 BAR_MS = 15 * 60 * 1000
 CONFIG = os.environ.get("AUTO_CONFIG", "c")
 TAIL = float(os.environ.get("AUTO_TAIL", "0.01"))
+MODEL_TAG = os.environ.get("AUTO_MODEL_TAG", f"{CONFIG}_roll730")
+POSITION_MODE = os.environ.get("AUTO_POSITION_MODE", "net_mode").strip().lower()
 SIZE = os.environ.get("AUTO_SIZE", "0.01")
 MAX_HOLD_BARS = int(os.environ.get("AUTO_MAX_HOLD_BARS", "48"))
 INTERVAL = max(15, int(os.environ.get("AUTO_INTERVAL", "30")))
 MAX_DATA_AGE = int(os.environ.get("AUTO_MAX_DATA_AGE", "1800"))
 STATE_PATH = Path(os.environ.get("AUTO_STATE", DATA / "auto_demo_state.json"))
-MAX_POSITIONS = max(1, int(os.environ.get("AUTO_MAX_POSITIONS", "2")))
+# Shared five-slot pool across stock and crypto contracts. Both directions are
+# eligible, but each instrument has one net position; this is a capacity limit,
+# not a 50/50 long-short split.
+MAX_POSITIONS = max(1, int(os.environ.get("AUTO_MAX_POSITIONS", "5")))
+# The combination backtest reserves one fifth of equity per accepted trade in
+# the shared five-slot pool. A signal may reverse an instrument only after its
+# existing net position has been closed.
+SLOT_WEIGHT = float(os.environ.get("AUTO_SLOT_WEIGHT", "0.20"))
+DYNAMIC_SIZE = os.environ.get("AUTO_DYNAMIC_SIZE", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+INSTRUMENT_CACHE_SECONDS = max(30, int(os.environ.get("AUTO_INSTRUMENT_CACHE_SECONDS", "300")))
 STOCK_SIZE = os.environ.get("AUTO_STOCK_SIZE", "1")
 STOCK_LOOKBACK_HOURS = max(1.0, float(os.environ.get("AUTO_STOCK_LOOKBACK_HOURS", "48")))
 STOCK_STOP_BPS = float(os.environ.get("AUTO_STOCK_STOP_BPS", "600"))
 STOCK_MAX_HOLD_HOURS = float(os.environ.get("AUTO_STOCK_MAX_HOLD_HOURS", "30"))
 _last_stock_feed_warning = 0.0
+_instrument_cache: dict[str, dict] = {}
+_instrument_cache_at = 0.0
+
+
+def order_pos_side(side: str) -> str | None:
+    """One-way OKX mode does not send a hedge ``posSide`` parameter."""
+    return None
+
+
+def position_key(inst_id: str, side: str) -> str:
+    """Use instrument and direction for state identity, including net mode."""
+    return f"{inst_id}|{side}"
+
+
+def _migrate_state(state: dict) -> dict:
+    """Migrate pre-hedge state that used a bare symbol as its key."""
+    positions = state.get("positions")
+    if not isinstance(positions, dict):
+        state["positions"] = {}
+        return state
+    migrated = {}
+    for old_key, row in positions.items():
+        if not isinstance(row, dict):
+            continue
+        inst = str(row.get("inst_id") or "")
+        if not inst:
+            inst = old_key.replace("USDT", "-USDT-SWAP") if old_key in SYMBOLS else old_key
+        side = str(row.get("side") or "").lower()
+        if side not in {"long", "short"}:
+            continue
+        row.setdefault("symbol", old_key if old_key in SYMBOLS else inst)
+        migrated[position_key(inst, side)] = row
+    state["positions"] = migrated
+    return state
 
 
 class LiveData:
@@ -168,7 +222,7 @@ def load_state() -> dict:
     if not STATE_PATH.exists():
         return {"positions": {}, "last_bar": 0, "trades": 0}
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return _migrate_state(json.loads(STATE_PATH.read_text(encoding="utf-8")))
     except (OSError, ValueError):
         return {"positions": {}, "last_bar": 0, "trades": 0}
 
@@ -180,45 +234,136 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_PATH)
 
 
+def _allowed_instruments() -> set[str]:
+    """Return only instruments owned by this strategy, never manual positions."""
+    allowed = {sym.replace("USDT", "-USDT-SWAP") for sym in SYMBOLS}
+    universe = STOCK_DATA / "universe.csv"
+    try:
+        frame = pd.read_csv(universe, usecols=["instId"])
+        allowed.update(
+            str(inst) for inst in frame["instId"].dropna()
+            if str(inst).endswith("-USDT-SWAP")
+        )
+    except (OSError, ValueError, KeyError):
+        pass
+    return allowed
+
+
 def remote_positions(client: DemoClient) -> dict[str, dict]:
     out = {}
-    rows = []
-    for inst_type in ("SWAP", "MARGIN"):
-        try:
-            rows.extend(client.positions(inst_type))
-        except RuntimeError:
-            # Spot tokenized stocks are represented by the margin account on
-            # accounts where shorting is enabled; some accounts reject MARGIN.
-            continue
+    # This strategy is contract-only. Do not import spot/margin positions or
+    # unrelated manual swaps into the shared pool.
+    allowed = _allowed_instruments()
+    try:
+        rows = client.positions("SWAP")
+    except RuntimeError:
+        rows = []
     for row in rows:
         inst = row.get("instId", "")
-        if not (inst.endswith("-USDT-SWAP") or inst.endswith("-USDT")):
+        if inst not in allowed:
             continue
         pos = float(row.get("pos") or 0)
         if abs(pos) < 1e-12:
             continue
-        sym = inst.replace("-USDT-SWAP", "USDT") if inst.endswith("-USDT-SWAP") else inst
-        out[sym] = {"inst_id": inst, "side": "long" if pos > 0 else "short",
-                    "size": str(abs(pos)), "entry_px": float(row.get("avgPx") or 0)}
+        if inst.endswith("-USDT-SWAP"):
+            base = inst.removesuffix("-USDT-SWAP")
+            # Crypto signal keys are the compact BTCUSDT form. Stock signal
+            # keys stay as their exact swap instId so they match SEC events.
+            sym = f"{base}USDT" if f"{base}USDT" in SYMBOLS else inst
+        else:
+            sym = inst
+        pos_side = str(row.get("posSide") or "").lower()
+        direction = pos_side if pos_side in {"long", "short"} else ("long" if pos > 0 else "short")
+        out[position_key(inst, direction)] = {
+            "symbol": sym, "inst_id": inst, "side": direction,
+            "size": str(abs(pos)), "entry_px": float(row.get("avgPx") or 0),
+        }
     return out
 
 
-def stock_short_available(client: DemoClient, inst_id: str) -> bool:
-    """Check the account's live borrow capacity before opening a stock short."""
+def contract_specs(client: DemoClient) -> dict[str, dict]:
+    """Cache live SWAP metadata used to convert notional into contract size."""
+    global _instrument_cache, _instrument_cache_at
+    now = time.monotonic()
+    if _instrument_cache and now - _instrument_cache_at < INSTRUMENT_CACHE_SECONDS:
+        return _instrument_cache
+    rows = client.instruments("SWAP")
+    _instrument_cache = {
+        str(row.get("instId")): row for row in rows
+        if str(row.get("instId", "")).endswith("-USDT-SWAP")
+        and str(row.get("state", "live")) == "live"
+    }
+    _instrument_cache_at = now
+    return _instrument_cache
+
+
+def _decimal(value: object, default: str = "0") -> Decimal:
     try:
-        rows = client.max_loan(inst_id, mgn_ccy="USDT", mgn_mode="cross")
-    except (requests.RequestException, RuntimeError, ValueError) as exc:
-        print(f"stock short check failed {inst_id}: {exc}", flush=True)
-        return False
-    sell = next((row for row in rows if row.get("side") == "sell"), {})
-    try:
-        available = float(sell.get("maxLoan") or 0.0)
-    except (TypeError, ValueError):
-        available = 0.0
-    if available <= 0:
-        print(f"stock short skipped {inst_id}: account maxLoan(sell)={sell.get('maxLoan', '0')}", flush=True)
-        return False
-    return True
+        result = Decimal(str(value))
+        return result if result.is_finite() else Decimal(default)
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal(default)
+
+
+def _format_size(size: Decimal, lot: Decimal) -> str:
+    text = format(size, "f")
+    if lot.as_tuple().exponent >= 0:
+        return str(int(size))
+    return text.rstrip("0").rstrip(".") or "0"
+
+
+def size_for_signal(client: DemoClient, sig: dict, mark: float,
+                    total_eq: object, specs: dict[str, dict]) -> str | None:
+    """Return an OKX-lot-aligned size for one shared-pool slot.
+
+    A configured fixed size is an opt-in fallback for read-only tests. Live
+    trading skips a symbol when dynamic sizing or account metadata is missing.
+    """
+    fallback = STOCK_SIZE if sig.get("asset_type") == "stock" else SIZE
+    if not DYNAMIC_SIZE:
+        return fallback
+    spec = specs.get(str(sig.get("inst_id")))
+    equity = _decimal(total_eq)
+    price = _decimal(mark)
+    if not spec or equity <= 0 or price <= 0 or SLOT_WEIGHT <= 0:
+        return fallback if use_fixed_size_fallback() else None
+    ct_val = _decimal(spec.get("ctVal"), "1")
+    ct_ccy = str(spec.get("ctValCcy") or "").upper()
+    # For BTC/altcoin swaps ctVal is denominated in the base coin; stock
+    # swaps and USD-quoted contracts use a fixed quote-currency value.
+    contract_notional = ct_val * price if ct_ccy not in {"USDT", "USD"} else ct_val
+    if contract_notional <= 0:
+        return fallback
+    lot = _decimal(spec.get("lotSz"), "1")
+    minimum = _decimal(spec.get("minSz"), str(lot))
+    if lot <= 0:
+        lot = minimum if minimum > 0 else Decimal("1")
+    target = equity * _decimal(str(SLOT_WEIGHT)) / contract_notional
+    size = (target / lot).to_integral_value(rounding=ROUND_DOWN) * lot
+    if size < minimum:
+        return None
+    return _format_size(size, lot)
+
+
+def use_fixed_size_fallback() -> bool:
+    """Keep the size fallback explicit and easy to audit in logs/tests."""
+    return os.environ.get("AUTO_DYNAMIC_SIZE_FALLBACK", "fixed").strip().lower() == "fixed"
+
+
+def validate_position_mode(client: DemoClient) -> str:
+    """Fail closed when configured execution mode differs from the account."""
+    if POSITION_MODE != "net_mode":
+        raise RuntimeError("this strategy requires AUTO_POSITION_MODE=net_mode (one-way contracts)")
+    rows = client.account_config()
+    actual = str(rows[0].get("posMode") or "") if rows else ""
+    if actual and actual != POSITION_MODE:
+        raise RuntimeError(
+            f"OKX account posMode={actual!r}, but strategy requires {POSITION_MODE!r}; "
+            "change the account mode before enabling AUTO_TRADE"
+        )
+    if not actual:
+        raise RuntimeError("OKX account config did not return posMode")
+    return actual
 
 
 def build_crypto_signals(data: LiveData) -> dict[str, dict]:
@@ -239,15 +384,15 @@ def build_crypto_signals(data: LiveData) -> dict[str, dict]:
         frames[sym] = build.build_symbol(sym, btc_ret if sym != "BTCUSDT" else None,
                                          klines_df=raw_k[sym], metrics_df=raw_m[sym])
 
-    model = lgb.Booster(model_file=str(MODELS / f"dir_{CONFIG}_fold5.txt"))
+    model = lgb.Booster(model_file=str(MODELS / f"dir_{MODEL_TAG}_fold5.txt"))
     feats = model.feature_name()
-    oos = pd.read_csv(RESULTS / f"oos_dir_{CONFIG}.csv.gz")
+    oos = pd.read_csv(RESULTS / f"oos_dir_{MODEL_TAG}.csv.gz")
     last_fold = oos[oos.fold == oos.fold.max()]
     hi = float(last_fold[f"hi_{TAIL}"].iloc[-1])
     lo = float(last_fold[f"lo_{TAIL}"].iloc[-1])
     signals = {}
     cutoff = int(time.time() * 1000) // BAR_MS * BAR_MS
-    for i, sym in enumerate(SYMBOLS):
+    for sym in SYMBOLS:
         f = frames[sym]
         # LightGBM can route missing values. Requiring every feature to be
         # non-null would discard all OKX bars because OKX has no top-trader and
@@ -257,7 +402,7 @@ def build_crypto_signals(data: LiveData) -> dict[str, dict]:
             continue
         row = rows.iloc[-1]
         x = row[[name for name in feats if name != "sym_code"]].to_frame().T.copy()
-        x["sym_code"] = i
+        x["sym_code"] = SYMBOL_CODE[sym]
         x = x[feats]
         x = x.apply(pd.to_numeric, errors="coerce").astype(float)
         p = float(model.predict(x, num_iteration=model.current_iteration())[0])
@@ -363,14 +508,32 @@ def build_stock_signals(now: pd.Timestamp) -> dict[str, dict]:
         return {}
 
 
+def signal_priority(sig: dict) -> float:
+    """Rank simultaneous entries using information known at entry time."""
+    if sig.get("asset_type") == "crypto" and sig.get("p_up") is not None:
+        return abs(float(sig["p_up"]) - 0.5)
+    return abs(float(sig.get("observe_move_bps") or 0.0)) / 10_000.0
+
+
 def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
+    state = _migrate_state(state)
     data = LiveData(client.s)
     now = pd.Timestamp.now(tz="UTC")
     signals = build_crypto_signals(data)
     signals.update(build_stock_signals(now))
+    # Reconcile before constructing tickers/signals so a position discovered
+    # after a restart is still managed even when its original stock event has
+    # left the SEC lookback window.
+    remote = remote_positions(client)
+    for key in list(state["positions"]):
+        if key not in remote:
+            state["positions"].pop(key, None)
+    for key, pos in remote.items():
+        state["positions"].setdefault(key, {**pos, "opened_bar": 0, "width": 0.0})
     # Continue managing a live position after its original stock event falls
     # outside the signal lookback window.
-    for sym, pos in state.get("positions", {}).items():
+    for key, pos in state.get("positions", {}).items():
+        sym = pos.get("symbol") or pos.get("inst_id") or key
         if sym not in signals:
             signals[sym] = {
                 "bar": int(now.timestamp() * 1000) // BAR_MS * BAR_MS,
@@ -384,28 +547,47 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
     # price. Stops and timeouts must react to the OKX market now, not to the
     # close of the previous 15m bar (which can be minutes old).
     ticker_symbols = list(SYMBOLS) + [s for s, x in signals.items() if x.get("asset_type") == "stock"]
+    ticker_symbols.extend(
+        pos.get("symbol") or pos.get("inst_id")
+        for pos in state["positions"].values()
+        if pos.get("symbol") not in ticker_symbols and pos.get("inst_id") not in ticker_symbols
+    )
+    ticker_symbols = list(dict.fromkeys(s for s in ticker_symbols if s))
     tickers = {sym: data.ticker(sym, signals.get(sym, {}).get("asset_type", "crypto")) for sym in ticker_symbols}
     now_ms = int(time.time() * 1000)
     for sym, (_, ts) in tickers.items():
         if now_ms - ts > MAX_DATA_AGE * 1000:
             raise RuntimeError(f"stale OKX ticker data for {sym}: age={(now_ms - ts) / 1000:.0f}s")
-    remote = remote_positions(client)
+    specs = contract_specs(client) if allow_orders else {}
     last_bars = state.setdefault("last_bars", {})
     balance = client.balance()
     save_balance(balance)
     total_eq = balance[0].get("totalEq") if balance else None
     cycle_id = uuid.uuid4().hex
-    # Reconcile remote state before considering a new signal.
-    for sym in list(state["positions"]):
-        if sym not in remote:
-            state["positions"].pop(sym, None)
-    for sym, pos in remote.items():
-        state["positions"].setdefault(sym, {**pos, "opened_bar": 0, "width": 0.0})
+    # Existing positions are handled first. New signals then compete for the
+    # shared pool by current signal strength; no asset-class quota is imposed.
+    def has_position(sym: str) -> bool:
+        return any(pos.get("symbol") == sym for pos in state["positions"].values())
 
-    for sym, sig in signals.items():
-        pos = state["positions"].get(sym)
+    ordered_signals = sorted(
+        signals.items(),
+        key=lambda item: (not has_position(item[0]), -signal_priority(item[1]), item[0]),
+    )
+    for sym, sig in ordered_signals:
         inst = sig.get("inst_id") or sym.replace("USDT", "-USDT-SWAP")
-        if pos:
+        matching = [
+            (key, pos) for key, pos in state["positions"].items()
+            if pos.get("symbol") == sym or pos.get("inst_id") == inst
+        ]
+        for key, pos in matching:
+            if pos.get("exit_ord_id"):
+                detail = client.order_detail(inst, str(pos["exit_ord_id"])) if allow_orders else {}
+                if detail.get("state") == "filled":
+                    state["positions"].pop(key, None)
+                    state["trades"] = int(state.get("trades", 0)) + 1
+                elif detail.get("state") in {"canceled", "mmp_canceled"}:
+                    pos.pop("exit_ord_id", None)
+                continue
             bars = max(0, (sig["bar"] - int(pos.get("opened_bar") or sig["bar"])) // BAR_MS)
             entry, width = float(pos.get("entry_px") or sig.get("close") or tickers[sym][0]), float(pos.get("width") or sig["width"])
             mark = tickers[sym][0]
@@ -415,35 +597,53 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
             max_bars = MAX_HOLD_BARS if sig.get("asset_type") == "crypto" else int(STOCK_MAX_HOLD_HOURS * 4)
             if allow_orders and (hit or bars >= max_bars):
                 side = "sell" if pos["side"] == "long" else "buy"
-                asset_type = pos.get("asset_type", sig.get("asset_type"))
-                td_mode = "isolated" if asset_type == "crypto" else (
-                    "cross" if pos["side"] == "short" else "cash"
-                )
+                # Tokenized stocks and crypto are both OKX perpetual contracts
+                # in this strategy. Use isolated contract margin on both sides.
+                td_mode = "isolated"
                 quick_mgn_type = None
-                if asset_type == "stock" and pos["side"] == "short":
-                    quick_mgn_type = "auto_repay" if pos["side"] == "short" else None
-                client.order(inst, side, pos.get("size", SIZE), td_mode, True, quick_mgn_type)
-                state["positions"].pop(sym, None)
-                state["trades"] = int(state.get("trades", 0)) + 1
-                print(f"EXIT {sym} strategy={pos.get('strategy', sig.get('strategy'))} side={pos['side']} mark={mark:.8g} bars={bars} hit={hit}", flush=True)
+                result = client.order(inst, side, pos.get("size", SIZE), td_mode, True,
+                                      quick_mgn_type, pos_side=order_pos_side(pos["side"]))
+                ord_id = result[0].get("ordId") if result else ""
+                detail = client.order_detail(inst, ord_id) if ord_id else {}
+                if detail.get("state") == "filled":
+                    state["positions"].pop(key, None)
+                    state["trades"] = int(state.get("trades", 0)) + 1
+                    print(f"EXIT {sym} strategy={pos.get('strategy', sig.get('strategy'))} side={pos['side']} mark={mark:.8g} bars={bars} hit={hit}", flush=True)
+                elif detail.get("state") in {"canceled", "mmp_canceled"}:
+                    pos.pop("exit_ord_id", None)
+                else:
+                    # Do not remove the state or open an opposite net order
+                    # until OKX confirms that this close has filled.
+                    pos["exit_ord_id"] = ord_id
+                    print(f"EXIT PENDING {sym} side={pos['side']} ord={ord_id} state={detail.get('state', 'submitted')}", flush=True)
+                    continue
+        bar_key = position_key(inst, sig["side"]) if sig["side"] in {"long", "short"} else sym
+        if sig["side"] == "flat" or sig["bar"] <= int(last_bars.get(bar_key, 0)):
             continue
-        if sig["side"] == "flat" or sig["bar"] <= int(last_bars.get(sym, 0)):
+        entry_key = position_key(inst, sig["side"])
+        if entry_key in state["positions"]:
+            continue
+        # In one-way/net mode an opposite signal cannot open alongside the
+        # current position. It is eligible only after the close above removed
+        # the existing state entry.
+        if any(pos.get("inst_id") == inst for pos in state["positions"].values()):
             continue
         if allow_orders and len(state["positions"]) < MAX_POSITIONS:
             side = "buy" if sig["side"] == "long" else "sell"
-            size = SIZE if sig.get("asset_type") == "crypto" else STOCK_SIZE
-            td_mode = "isolated" if sig.get("asset_type") == "crypto" else "cash"
+            size = size_for_signal(client, sig, tickers[sym][0], total_eq, specs)
+            if not size:
+                print(f"ENTRY SKIP {sym}: no valid contract size for equity={total_eq}", flush=True)
+                continue
+            # Both asset classes are -USDT-SWAP contracts; stock cash/margin
+            # modes would turn this into a different execution strategy.
+            td_mode = "isolated"
             quick_mgn_type = None
-            if sig.get("asset_type") == "stock":
-                if sig["side"] == "short" and not stock_short_available(client, inst):
-                    continue
-                td_mode = "cross"
-                quick_mgn_type = "auto_borrow" if sig["side"] == "short" else None
-            result = client.order(inst, side, size, td_mode, False, quick_mgn_type)
+            result = client.order(inst, side, size, td_mode, False, quick_mgn_type,
+                                  pos_side=order_pos_side(sig["side"]))
             ord_id = result[0].get("ordId") if result else ""
             detail = client.order_detail(inst, ord_id) if ord_id else {}
             if detail.get("state") == "filled":
-                state["positions"][sym] = {"inst_id": inst, "side": sig["side"], "size": size,
+                state["positions"][entry_key] = {"symbol": sym, "inst_id": inst, "side": sig["side"], "size": size,
                                            "entry_px": float(detail.get("avgPx") or sig.get("close") or tickers[sym][0]),
                                            "width": sig["width"], "opened_bar": sig["bar"], "ord_id": ord_id,
                                            "strategy": sig.get("strategy"), "asset_type": sig.get("asset_type")}
@@ -451,7 +651,9 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
                 p_text = f"{sig['p_up']:.5f}" if sig.get("p_up") is not None else "n/a"
                 print(f"ENTRY {sym} strategy={sig.get('strategy')} side={sig['side']} p={p_text} ord={ord_id}", flush=True)
     for sym, sig in signals.items():
-        last_bars[sym] = max(int(last_bars.get(sym, 0)), int(sig.get("bar") or 0))
+        inst = sig.get("inst_id") or sym.replace("USDT", "-USDT-SWAP")
+        key = position_key(inst, sig["side"]) if sig.get("side") in {"long", "short"} else sym
+        last_bars[key] = max(int(last_bars.get(key, 0)), int(sig.get("bar") or 0))
     state["last_bar"] = max(last_bars.values(), default=int(state.get("last_bar", 0)))
     # Store a row for every symbol on every cycle, including flat symbols. This
     # makes exposure, signal drift, latency and mark-to-market history queryable
@@ -459,24 +661,28 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
     snapshot_rows = []
     for sym in ticker_symbols:
         sig = signals.get(sym, {})
-        pos = state["positions"].get(sym, {})
         mark, ticker_ts = tickers[sym]
-        entry = float(pos.get("entry_px") or 0.0)
-        width = float(pos.get("width") or sig.get("width") or 0.0)
-        side = pos.get("side")
-        snapshot_rows.append({
-            "ts": pd.Timestamp.now(tz="UTC").isoformat(), "cycle_id": cycle_id,
-            "symbol": sym, "strategy": sig.get("strategy"), "asset_type": sig.get("asset_type"),
-            "bar_ts": int(sig.get("bar") or 0),
-            "signal_side": sig.get("side", "unknown"), "p_up": sig.get("p_up"),
-            "signal_close": sig.get("close"), "ticker_px": mark, "ticker_ts": int(ticker_ts),
-            "position_side": side, "position_size": pos.get("size"), "entry_px": entry or None,
-            "width": width or None,
-            "stop_px": (entry * (1 - width) if side == "long" else entry * (1 + width)) if side and entry and width else None,
-            "take_px": (entry * (1 + width) if side == "long" else entry * (1 - width)) if side and entry and width else None,
-            "total_eq": total_eq,
-            "raw_json": json.dumps({"signal": sig, "position": pos}, ensure_ascii=True),
-        })
+        positions = [pos for pos in state["positions"].values()
+                     if pos.get("symbol") == sym or pos.get("inst_id") == sig.get("inst_id")]
+        # Keep one flat row when there is no position, and one row for the
+        # instrument's single net position when it is open.
+        for pos in positions or [{}]:
+            entry = float(pos.get("entry_px") or 0.0)
+            width = float(pos.get("width") or sig.get("width") or 0.0)
+            side = pos.get("side")
+            snapshot_rows.append({
+                "ts": pd.Timestamp.now(tz="UTC").isoformat(), "cycle_id": cycle_id,
+                "symbol": sym, "strategy": sig.get("strategy"), "asset_type": sig.get("asset_type"),
+                "bar_ts": int(sig.get("bar") or 0),
+                "signal_side": sig.get("side", "unknown"), "p_up": sig.get("p_up"),
+                "signal_close": sig.get("close"), "ticker_px": mark, "ticker_ts": int(ticker_ts),
+                "position_side": side, "position_size": pos.get("size"), "entry_px": entry or None,
+                "width": width or None,
+                "stop_px": (entry * (1 - width) if side == "long" else entry * (1 + width)) if side and entry and width else None,
+                "take_px": (entry * (1 + width) if side == "long" else entry * (1 - width)) if side and entry and width else None,
+                "total_eq": total_eq,
+                "raw_json": json.dumps({"signal": sig, "position": pos}, ensure_ascii=True),
+            })
     save_strategy_snapshots(snapshot_rows)
     save_state(state)
     print("signals:", json.dumps(signals, ensure_ascii=True),
@@ -494,10 +700,14 @@ def main() -> None:
     if CONFIG != "c" or abs(TAIL - 0.01) > 1e-9:
         print(f"warning: non-default strategy config={CONFIG} tail={TAIL}", flush=True)
     client = DemoClient()
+    position_mode = validate_position_mode(client)
     state = load_state()
     allow = os.environ.get("AUTO_TRADE", "false").lower() in {"1", "true", "yes", "on"} and not args.observe
-    print(f"auto demo config={CONFIG} tail={TAIL} allow_orders={allow} interval={INTERVAL}s "
-          f"max_positions={MAX_POSITIONS} max_data_age={MAX_DATA_AGE}s "
+    print(f"auto demo model={MODEL_TAG} universe={len(SYMBOLS)} tail={TAIL} "
+          f"allow_orders={allow} interval={INTERVAL}s "
+          f"shared_pool_slots={MAX_POSITIONS} slot_weight={SLOT_WEIGHT:.4f} "
+          f"dynamic_size={DYNAMIC_SIZE} position_mode={position_mode} "
+          f"max_data_age={MAX_DATA_AGE}s "
           f"price_source=OKX metrics_source=OKX simulated_header={int(SIMULATED_TRADING)}", flush=True)
     while True:
         try:

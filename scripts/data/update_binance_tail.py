@@ -20,14 +20,34 @@ ROOT = Path(__file__).resolve().parents[2]
 DATA = Path(os.environ.get("BINANCE_DATA_DIR", ROOT / "data"))
 STATUS = Path(os.environ.get("BINANCE_TAIL_STATUS", DATA / "binance_tail_status.json"))
 BASE = os.environ.get("BINANCE_FAPI_URL", "https://fapi.binance.com")
-SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+SYMBOLS = (
+    "ADAUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT",
+    "ETHUSDT", "LINKUSDT", "SOLUSDT", "XRPUSDT",
+)
+
+
+def _dotenv_value(name: str) -> str | None:
+    """Read one optional local .env value without overriding the shell."""
+    path = ROOT / ".env"
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if line.startswith(f"{name}="):
+                value = line.split("=", 1)[1].strip()
+                if value[:1] == value[-1:] and value[:1] in {"'", '"'}:
+                    value = value[1:-1]
+                return value or None
+    except OSError:
+        pass
+    return None
 
 
 def session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": "okx-quant/binance-tail"})
     proxy = (os.environ.get("BINANCE_PROXY_URL") or os.environ.get("HTTPS_PROXY")
-             or os.environ.get("HTTP_PROXY") or os.environ.get("OKX_PROXY_URL"))
+             or os.environ.get("HTTP_PROXY") or os.environ.get("OKX_PROXY_URL")
+             or _dotenv_value("BINANCE_PROXY_URL") or _dotenv_value("OKX_PROXY_URL"))
     if proxy:
         s.proxies.update({"http": proxy, "https": proxy})
     return s

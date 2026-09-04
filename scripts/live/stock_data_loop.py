@@ -19,7 +19,7 @@ import requests
 from strategies.stocks.market.okx import OKXClient, OKXError, update_cache
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA = Path(os.environ.get("AUTO_STOCK_DATA", ROOT / "data" / "stocks"))
+DATA = Path(os.environ.get("AUTO_STOCK_DATA", ROOT / "data" / "stocks_swap"))
 FILINGS = Path(os.environ.get("AUTO_STOCK_FILINGS", DATA / "sec_filings_raw.csv"))
 UNIVERSE = Path(os.environ.get("AUTO_STOCK_UNIVERSE", DATA / "universe.csv"))
 INTERVAL = max(60, int(os.environ.get("STOCK_REFRESH_INTERVAL", "300")))

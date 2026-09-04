@@ -25,8 +25,19 @@ DATA = Path(os.environ.get("OKX_CRYPTO_DATA_DIR", ROOT / "data"))
 KLINE_DIR = DATA / "okx_klines"
 METRIC_DIR = DATA / "okx_metrics"
 STATUS = Path(os.environ.get("OKX_CRYPTO_STATUS", DATA / "okx_crypto_status.json"))
-SYMBOLS = {"BTCUSDT": "BTC-USDT-SWAP", "ETHUSDT": "ETH-USDT-SWAP", "SOLUSDT": "SOL-USDT-SWAP"}
-START = pd.Timestamp(os.environ.get("OKX_CRYPTO_START", "2026-09-01"), tz="UTC")
+SYMBOLS = {
+    "ADAUSDT": "ADA-USDT-SWAP", "BNBUSDT": "BNB-USDT-SWAP",
+    "BTCUSDT": "BTC-USDT-SWAP", "DOGEUSDT": "DOGE-USDT-SWAP",
+    "ETHUSDT": "ETH-USDT-SWAP", "LINKUSDT": "LINK-USDT-SWAP",
+    "SOLUSDT": "SOL-USDT-SWAP", "XRPUSDT": "XRP-USDT-SWAP",
+}
+# Keep enough OKX contract history for the longest rolling feature (384 x 15m
+# bars is four days). An explicit start remains available for reproducible
+# backfills; live refreshes default to a moving 30-day window.
+HISTORY_DAYS = max(7, int(os.environ.get("OKX_CRYPTO_HISTORY_DAYS", "30")))
+_start_raw = os.environ.get("OKX_CRYPTO_START")
+START = (pd.to_datetime(_start_raw, utc=True)
+         if _start_raw else pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=HISTORY_DAYS))
 INTERVAL = max(60, int(os.environ.get("OKX_CRYPTO_INTERVAL", "300")))
 
 
