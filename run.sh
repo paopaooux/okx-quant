@@ -50,7 +50,7 @@ case "${1:-combinations}" in
         exec "$PYTHON_BIN" -u scripts/stocks/run_strategy.py
         ;;
     combinations|combo|all)
-        exec "$PYTHON_BIN" -u -m scripts.combinations.run
+        exec "$PYTHON_BIN" -u -m scripts.combinations.run "${@:2}"
         ;;
     help|-h|--help)
         usage
