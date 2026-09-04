@@ -1,4 +1,4 @@
-"""Minimal OKX demo-trading client.
+"""Minimal OKX account client used by the live strategy.
 
 This module deliberately does not place orders unless ``--trade`` is supplied.
 Credentials are read from OKX_API_KEY/OKX_API_SECRET/OKX_API_PASSPHRASE.
@@ -75,7 +75,7 @@ def db_connect():
       stop_px REAL, take_px REAL, total_eq TEXT, raw_json TEXT NOT NULL
     );
     """)
-    # Keep databases created by earlier demo versions usable.
+    # Keep databases created by earlier versions usable.
     columns = {row[1] for row in db.execute("PRAGMA table_info(balance_snapshots)")}
     if "total_eq" not in columns:
         db.execute("ALTER TABLE balance_snapshots ADD COLUMN total_eq TEXT")
@@ -120,7 +120,7 @@ def save_account_data(positions, fills, bills):
 
 
 def save_strategy_snapshots(rows):
-    """Persist one row per symbol and cycle for fine-grained paper-trading analysis."""
+    """Persist one row per symbol and cycle for execution analysis."""
     if not rows:
         return
     with db_connect() as db:
@@ -261,8 +261,8 @@ class DemoClient:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true", help="check demo balance and instrument metadata")
-    ap.add_argument("--trade", action="store_true", help="place one demo market order")
+    ap.add_argument("--check", action="store_true", help="check OKX balance and instrument metadata")
+    ap.add_argument("--trade", action="store_true", help="place one market order on the configured OKX account")
     ap.add_argument("--inst-id", help="OKX instrument, e.g. BTC-USDT-SWAP")
     ap.add_argument("--side", choices=("buy", "sell"), help="market order direction; hedge side is set by the strategy")
     ap.add_argument("--sz", help="order size in contracts (not coins)")
@@ -288,7 +288,7 @@ def main():
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         ap.error(f"OKX 连接/认证失败: {exc}")
     save_balance(balance)
-    print("demo balance:", balance)
+    print("OKX balance:", balance)
     try:
         positions, fills, bills = c.positions(), c.fills(), c.bills()
         save_account_data(positions, fills, bills)
@@ -324,7 +324,7 @@ def main():
                          (:ts,:inst_id,:side,:sz,:td_mode,:reduce_only,:ord_id,:state,
                           :fill_sz,:avg_px,:fee,:pnl,:raw_json)""", row)
         save_balance(c.balance())
-        print("demo order:", result)
+        print("OKX order:", result)
         print("filled detail:", detail)
     else:
         print("safe mode: no orders sent; signal engine is not connected yet")

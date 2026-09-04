@@ -1,4 +1,4 @@
-"""Run the three long-lived paper-trading processes in one container.
+"""Run the three long-lived data and trading processes in one container.
 
 Docker normally gives each service its own container, but the deployment target
 for this project intentionally uses one named container. This small supervisor

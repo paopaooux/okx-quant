@@ -1,8 +1,8 @@
-"""Small, conservative automatic trader for the OKX simulated account.
+"""Small, conservative automatic trader for the configured OKX account.
 
 The execution venue is OKX throughout: completed OKX 15m candles provide the
-bar clock and signal prices, OKX ticker prices drive exits, and ``DemoClient``
-places the resulting simulated orders. Some Binance-only positioning fields
+bar clock and signal prices, OKX ticker prices drive exits, and the OKX client
+places the resulting orders. Some Binance-only positioning fields
 are unavailable on OKX and remain missing values; LightGBM handles those fields
 explicitly rather than fabricating cross-venue proxies.
 """
