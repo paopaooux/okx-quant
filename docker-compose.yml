@@ -49,11 +49,8 @@ services:
       AUTO_MAX_HOLD_BARS: "48"
       OKX_DEMO_DB: /app/data/okx_demo.sqlite3
       AUTO_STOCK_DATA: /app/data/stocks_swap
-      STOCK_SEC_INTERVAL: "60"
       STOCK_CANDLE_INTERVAL: "300"
       STOCK_HISTORY_DAYS: "4"
-      SEC_LOOKBACK_DAYS: "30"
-      SEC_USER_AGENT: ${SEC_USER_AGENT:-okx-quant research contact@example.com}
       OKX_CRYPTO_HISTORY_DAYS: "30"
       OKX_CRYPTO_INTERVAL: "60"
     volumes:

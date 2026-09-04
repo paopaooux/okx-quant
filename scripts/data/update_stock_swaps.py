@@ -1,10 +1,8 @@
 """Build a deduplicated OKX stock-perpetual archive for the stock strategy.
 
-The existing ``data/stocks`` archive contains tokenized-stock spot symbols such
-as ``XAAPL-USDT``.  Live execution can instead use ``AAPL-USDT-SWAP``
-perpetuals, which have independent prices, contract sizing and short-side
-liquidity.  This updater keeps that contract universe and its candles in a
-separate directory so the two venues cannot be mixed accidentally.
+Live execution uses ``AAPL-USDT-SWAP`` perpetuals, which have independent
+prices, contract sizing and short-side liquidity.  This updater owns that
+contract universe and its candles.
 """
 from __future__ import annotations
 
@@ -24,7 +22,6 @@ if str(ROOT) not in sys.path:
 from strategies.stocks.market.okx import OKXClient, OKXError, update_cache
 from strategies.stocks.market.universe_tech import TECH
 
-SOURCE = Path(os.environ.get("STOCK_SPOT_DATA_DIR", ROOT / "data" / "stocks"))
 TARGET = Path(os.environ.get("STOCK_SWAP_DATA_DIR", ROOT / "data" / "stocks_swap"))
 HISTORY_DAYS = max(7, int(os.environ.get("STOCK_SWAP_HISTORY_DAYS", "400")))
 MAX_PAGES = max(20, int(os.environ.get("STOCK_SWAP_MAX_PAGES", "500")))
@@ -77,22 +74,6 @@ def write_universe(frame: pd.DataFrame) -> None:
     frame.to_csv(TARGET / "universe.csv", index=False)
 
 
-def remap_filings(frame: pd.DataFrame) -> int:
-    source = SOURCE / "sec_filings_raw.csv"
-    if not source.exists():
-        raise FileNotFoundError(source)
-    filings = pd.read_csv(source)
-    if "ticker" not in filings.columns:
-        raise ValueError(f"SEC archive is missing ticker: {source}")
-    by_ticker = frame.set_index("ticker")["instId"].to_dict()
-    out = filings.copy()
-    out["instId"] = out["ticker"].astype(str).map(by_ticker)
-    out = out.loc[out.instId.notna()].copy()
-    out = out.drop_duplicates("accession")
-    out.to_csv(TARGET / "sec_filings_raw.csv", index=False)
-    return len(out)
-
-
 def refresh_candles(client: OKXClient, frame: pd.DataFrame, symbols: set[str] | None = None) -> dict:
     done, failed = [], []
     selected = frame if symbols is None else frame.loc[frame.ticker.isin(symbols)]
@@ -139,8 +120,7 @@ def main() -> int:
     client = OKXClient(timeout=30)
     universe = discover(client)
     write_universe(universe)
-    count = remap_filings(universe)
-    print(f"[stocks-swap] universe={len(universe)} SEC rows={count} target={TARGET}", flush=True)
+    print(f"[stocks-swap] universe={len(universe)} target={TARGET}", flush=True)
     if args.discover_only:
         return 0
     symbols = set(args.tickers) if args.tickers else None

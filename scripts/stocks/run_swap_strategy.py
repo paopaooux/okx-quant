@@ -1,4 +1,4 @@
-"""Run the stock strategy against OKX stock perpetuals at 1x notional."""
+"""Run the stock-perpetual off-hours strategy."""
 from __future__ import annotations
 
 import os

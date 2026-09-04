@@ -15,3 +15,6 @@ okx-stock-strategy = "scripts.run_stock_strategy:main"
 
 [tool.setuptools.packages.find]
 include = ["scripts*", "strategies*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -3,7 +3,6 @@ from __future__ import annotations
 import pandas as pd
 
 from strategies.stocks.config import Config
-from strategies.stocks.research.news_strategy import build_events
 from strategies.stocks.research.backtest import Rules, run
 from strategies.stocks.research.stock_categories import classify_universe, validate_categories
 
@@ -13,33 +12,6 @@ def test_stock_config_uses_external_archive(monkeypatch):
     cfg = Config()
     assert cfg.data_dir == "/tmp/stock-alpha-archive/data"
     assert cfg.result_dir == "/tmp/stock-alpha-archive/results"
-
-
-def test_empty_filings_produce_no_events():
-    frames = {"XTEST-USDT": pd.DataFrame()}
-    filings = pd.DataFrame(columns=["form", "accepted", "instId"])
-    assert build_events(filings, frames).empty
-
-
-def test_event_entry_is_first_completed_bar_after_decision():
-    index = pd.date_range(
-        "2026-07-16 20:00:00", periods=8, freq="5min", tz="UTC"
-    )
-    frame = pd.DataFrame({"close": [100, 100, 101, 101, 101, 101, 101, 101]}, index=index)
-    filings = pd.DataFrame([{
-        "form": "8-K",
-        "accepted": "2026-07-16T20:00:00Z",
-        "instId": "XTEST-USDT",
-        "ticker": "TEST",
-        "items": "8.01",
-    }])
-
-    decision = pd.Timestamp("2026-07-16 20:31:00", tz="UTC")
-    events = build_events(filings, {"XTEST-USDT": frame}, observe_minutes=31)
-
-    assert len(events) == 1
-    assert events.iloc[0].event_ts >= decision
-    assert events.iloc[0].event_ts == pd.Timestamp("2026-07-16 20:35:00", tz="UTC")
 
 
 def test_stock_categories_cover_current_universe():

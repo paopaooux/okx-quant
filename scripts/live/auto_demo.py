@@ -25,7 +25,8 @@ from scripts.data import build
 from scripts.live.okx_demo import BASE, SIMULATED_TRADING, DemoClient, save_balance, save_strategy_snapshots
 from strategies.stocks.market import data as stock_data
 from strategies.stocks.market.universe_tech import TECH
-from strategies.stocks.research import news_strategy
+from strategies.stocks.config import Config as StockConfig
+from strategies.stocks.research import events as stock_events
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA, RESULTS, MODELS = ROOT / "data", ROOT / "results" / "crypto", ROOT / "models"
@@ -37,7 +38,6 @@ SYMBOLS = (
 )
 SYMBOL_CODE = {symbol: i for i, symbol in enumerate(SYMBOLS)}
 STOCK_DATA = Path(os.environ.get("AUTO_STOCK_DATA", DATA / "stocks_swap"))
-STOCK_FILINGS = Path(os.environ.get("AUTO_STOCK_FILINGS", STOCK_DATA / "sec_filings_raw.csv"))
 STOCK_STATUS = Path(os.environ.get("AUTO_STOCK_STATUS", STOCK_DATA / "data_status.json"))
 STOCK_DATA_MAX_AGE = max(120, int(os.environ.get("STOCK_DATA_MAX_AGE", "900")))
 BAR_MS = 15 * 60 * 1000
@@ -63,7 +63,6 @@ DYNAMIC_SIZE = os.environ.get("AUTO_DYNAMIC_SIZE", "true").strip().lower() in {
 }
 INSTRUMENT_CACHE_SECONDS = max(30, int(os.environ.get("AUTO_INSTRUMENT_CACHE_SECONDS", "300")))
 STOCK_SIZE = os.environ.get("AUTO_STOCK_SIZE", "1")
-STOCK_LOOKBACK_HOURS = max(1.0, float(os.environ.get("AUTO_STOCK_LOOKBACK_HOURS", "48")))
 STOCK_STOP_BPS = float(os.environ.get("AUTO_STOCK_STOP_BPS", "600"))
 STOCK_MAX_HOLD_HOURS = float(os.environ.get("AUTO_STOCK_MAX_HOLD_HOURS", "30"))
 _last_stock_feed_warning = 0.0
@@ -268,7 +267,7 @@ def remote_positions(client: DemoClient) -> dict[str, dict]:
         if inst.endswith("-USDT-SWAP"):
             base = inst.removesuffix("-USDT-SWAP")
             # Crypto signal keys are the compact BTCUSDT form. Stock signal
-            # keys stay as their exact swap instId so they match SEC events.
+            # keys stay as their exact swap instId so they match stock events.
             sym = f"{base}USDT" if f"{base}USDT" in SYMBOLS else inst
         else:
             sym = inst
@@ -421,27 +420,15 @@ def build_crypto_signals(data: LiveData) -> dict[str, dict]:
 
 
 def build_stock_signals(now: pd.Timestamp) -> dict[str, dict]:
-    """Build tokenized-stock event signals from the locally refreshed SEC feed.
-
-    The SEC feed is intentionally an input file: a separate poller can refresh
-    it without coupling credentials or network retries to the trading loop.
-    Events are restricted to the recent lookback so a restart cannot replay old
-    historical backtest events as live orders.
-    """
+    """Build stock-perpetual signals from recent OKX off-hours dislocations."""
     global _last_stock_feed_warning
-    if not STOCK_FILINGS.exists():
-        return {}
-    # A mounted CSV can survive a restarted poller indefinitely. Require a
-    # recent successful heartbeat before treating it as a live feed; otherwise
-    # the crypto sleeve can continue while stale stock events are skipped.
     try:
         status = json.loads(STOCK_STATUS.read_text(encoding="utf-8"))
         now_epoch = now.timestamp()
         updated = pd.Timestamp(status.get("updated_at"), tz="UTC").timestamp()
-        sec_ok = pd.Timestamp(status.get("sec", {}).get("last_success_at"), tz="UTC").timestamp()
         candles_ok = pd.Timestamp(status.get("candles", {}).get("last_success_at"), tz="UTC").timestamp()
-        if min(now_epoch - updated, now_epoch - sec_ok, now_epoch - candles_ok) < -5 or \
-                max(now_epoch - updated, now_epoch - sec_ok, now_epoch - candles_ok) > STOCK_DATA_MAX_AGE:
+        if min(now_epoch - updated, now_epoch - candles_ok) < -5 or \
+                max(now_epoch - updated, now_epoch - candles_ok) > STOCK_DATA_MAX_AGE:
             raise ValueError("stock feed heartbeat is stale")
     except (OSError, ValueError, TypeError, KeyError):
         if time.time() - _last_stock_feed_warning > STOCK_DATA_MAX_AGE:
@@ -449,43 +436,19 @@ def build_stock_signals(now: pd.Timestamp) -> dict[str, dict]:
             _last_stock_feed_warning = time.time()
         return {}
     try:
-        filings = pd.read_csv(STOCK_FILINGS)
-        # SEC history contains several timestamp shapes (date-only legacy
-        # rows and ISO rows with/without fractional seconds). Pandas 3's
-        # strict single-format inference would silently drop the newest rows.
-        filings["accepted"] = pd.to_datetime(filings["accepted"], utc=True,
-                                              errors="coerce", format="mixed")
-        cutoff = now - pd.Timedelta(hours=STOCK_LOOKBACK_HOURS)
-        filings = filings.loc[
-            (filings["accepted"] >= cutoff)
-            & filings.form.astype(str).str.startswith("8-K")
-            & filings.ticker.astype(str).isin(TECH)
-        ].drop_duplicates("accession")
-        if filings.empty:
+        universe_path = STOCK_DATA / "universe.csv"
+        if not universe_path.exists():
             return {}
-        inst_ids = sorted(filings.instId.dropna().unique())
+        universe = pd.read_csv(universe_path)
+        inst_ids = sorted(universe.loc[universe.ticker.astype(str).isin(TECH), "instId"].dropna().unique())
+        ticker_by_inst = universe.set_index("instId")["ticker"].astype(str).to_dict()
         frames = stock_data.to_bar_end(stock_data.load_panel(inst_ids, "5m", STOCK_DATA), "5m")
-        normal = news_strategy.build_events(
-            filings, frames, observe_minutes=90, min_move_bps=50,
-            max_stale_minutes=90, require_closed=True,
-        )
-        earnings = news_strategy.build_events(
-            filings, frames, observe_minutes=45, min_move_bps=0,
-            max_stale_minutes=90, require_closed=True,
-        )
-        universe_path = STOCK_FILINGS.parent / "universe.csv"
-        if universe_path.exists():
-            universe = pd.read_csv(universe_path)
-            normal = news_strategy.annotate_shortable(normal, universe)
-            earnings = news_strategy.annotate_shortable(earnings, universe)
-        events = pd.concat([normal, earnings], ignore_index=True, sort=False)
+        cfg = StockConfig(data_dir=str(STOCK_DATA), result_dir=str(ROOT / "results" / "stocks_swap"))
+        events = stock_events.off_hours_dislocation(frames, cfg)
         if events.empty:
             return {}
         out = {}
         for row in events.sort_values("event_ts").itertuples(index=False):
-            # One signal per instrument; the latest event wins if filings overlap.
-            if not bool(getattr(row, "executable", True)):
-                continue
             event_ts = pd.Timestamp(row.event_ts)
             # Never enter a position on a stale event after a restart. The
             # event must be newly actionable within one loop window; older
@@ -493,14 +456,15 @@ def build_stock_signals(now: pd.Timestamp) -> dict[str, dict]:
             if event_ts < now - pd.Timedelta(minutes=max(30, INTERVAL * 2)) or event_ts > now:
                 continue
             inst = str(row.inst_id)
+            ticker = ticker_by_inst.get(inst, inst.split("-", 1)[0])
             out[inst] = {
                 "bar": int(event_ts.timestamp() * 1000),
                 "side": "long" if int(row.side) > 0 else "short",
                 "p_up": None, "close": None, "width": STOCK_STOP_BPS / 1e4,
                 "strategy": "xstock_hybrid", "asset_type": "stock", "inst_id": inst,
                 "event_ts": event_ts.isoformat(),
-                "ticker": str(row.ticker), "resolve_ts": pd.Timestamp(row.resolve_ts).isoformat(),
-                "observe_move_bps": float(row.abs_move_bps),
+                "ticker": ticker, "resolve_ts": pd.Timestamp(row.resolve_ts).isoformat(),
+                "observe_move_bps": float(abs(row.deviation) * 1e4),
             }
         return out
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -523,15 +487,15 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
     signals.update(build_stock_signals(now))
     # Reconcile before constructing tickers/signals so a position discovered
     # after a restart is still managed even when its original stock event has
-    # left the SEC lookback window.
+    # left the current candle window.
     remote = remote_positions(client)
     for key in list(state["positions"]):
         if key not in remote:
             state["positions"].pop(key, None)
     for key, pos in remote.items():
         state["positions"].setdefault(key, {**pos, "opened_bar": 0, "width": 0.0})
-    # Continue managing a live position after its original stock event falls
-    # outside the signal lookback window.
+    # Continue managing a live position after its original stock event leaves
+    # the current candle window.
     for key, pos in state.get("positions", {}).items():
         sym = pos.get("symbol") or pos.get("inst_id") or key
         if sym not in signals:
