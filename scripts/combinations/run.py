@@ -25,7 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from strategies.stocks.research import portfolio
 
 BAR_MINUTES = 15
-# Primary paper-trading universe from STRATEGY_CARD_CRYPTO_ROLL730.md.
+# Primary paper-trading universe from docs/给后续LLM的研究上下文.md.
 # Keep this explicit so a partial research artifact (for example the temporary
 # six-symbol drawdown run) cannot silently change sleeve weights.
 QUANT_SYMBOLS = (
@@ -321,25 +321,23 @@ def _write_bundle(
             f"{row.stock_win_rate:.1%} | {row.quant_win_rate:.1%} |"
         )
     summary = (
-        "# Cross-Strategy Combination Backtest\n\n"
-        f"- Run: `{run_id}`\n"
-        f"- Window (UTC): `{meta['sample_start_utc']}` to `{meta['sample_end_utc']}`\n"
-        f"- Stock trades: {len(stock)}; crypto trades: {len(quant)}\n"
-        f"- Trade count: stock **{len(stock)}**, crypto **{len(quant)}**, combined candidates **{len(stock) + len(quant)}**\n"
-        f"- Quant OOS data through: `{meta['quant_oos_end_utc']}`; last quant signal: "
+        "# 股票与加密组合回测\n\n"
+        f"- 运行编号：`{run_id}`\n"
+        f"- 共同窗口（UTC）：`{meta['sample_start_utc']}` 至 `{meta['sample_end_utc']}`\n"
+        f"- 股票成交：{len(stock)} 笔；加密成交：{len(quant)} 笔\n"
+        f"- 候选成交：股票 **{len(stock)}**，加密 **{len(quant)}**，合计 **{len(stock) + len(quant)}**\n"
+        f"- 加密 OOS 数据截至：`{meta['quant_oos_end_utc']}`；最后信号："
         f"`{meta['quant_signal_end_utc']}`\n"
-        f"- Primary result: stock {meta['stock_slots']}-slot + crypto {meta['quant_slots']}-slot components, "
-        f"with shared-pool comparison through {meta['shared_pool_slots']} slots\n"
-        f"- Static 50/50 reference return (not annualized): **{combo.total_return * 100:+.2f}%**\n"
-        f"- Static 50/50 sleeve win rates: stocks **{combo.stock_win_rate:.1%}**, "
-        f"crypto **{combo.quant_win_rate:.1%}**\n\n"
-        "## Reference allocations\n\n"
-        "| Stock weight | Interval return | Max drawdown | Max DD recovery (d) | Longest DD (d) | Longest DD recovery (d) | Daily Sharpe | Stock win rate | Quant win rate |\n"
+        f"- 主结果：股票 {meta['stock_slots']} 槽、加密 {meta['quant_slots']} 槽，并比较共享池 1～{meta['shared_pool_slots']} 槽\n"
+        f"- 静态 50/50 参考收益（未年化）：**{combo.total_return * 100:+.2f}%**\n"
+        f"- 静态 50/50 胜率：股票 **{combo.stock_win_rate:.1%}**，加密 **{combo.quant_win_rate:.1%}**\n\n"
+        "## 静态配置\n\n"
+        "| 股票权重 | 区间收益 | 最大回撤 | 最大回撤修复（天） | 最长回撤（天） | 最长回撤修复（天） | 日 Sharpe | 股票胜率 | 加密胜率 |\n"
         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         + "\n".join(allocation_rows)
         + "\n\n"
-        "## Shared-pool strategies\n\n"
-        "| Strategy | Interval return | Max drawdown | Max DD recovery (d) | Longest DD (d) | Longest DD recovery (d) | Daily Sharpe | Trades | Trade win rate | Avg net (bp) | Avg total exposure | Avg hold (h) | Avg concurrent | Skipped entries |\n"
+        "## 共享资金池策略\n\n"
+        "| 策略 | 区间收益 | 最大回撤 | 最大回撤修复（天） | 最长回撤（天） | 最长回撤修复（天） | 日 Sharpe | 成交数 | 成交胜率 | 平均净收益（bp） | 平均总敞口 | 平均持仓（小时） | 平均并发 | 跳过入场 |\n"
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         + "\n".join(
             f"| {row.scope} | {row.total_return:+.2%} | "
@@ -352,8 +350,8 @@ def _write_bundle(
             for _, row in reports.loc[reports["mode"] == "pooled"].iterrows()
         )
         + "\n\n"
-        "## Strategy metric list\n\n"
-        "| Strategy | Scope | Slots | Return | CAGR | Sharpe | Current DD | Max DD | Max DD recovery (d) | Longest DD (d) | Longest DD recovery (d) | Trade count | Wins | Losses | Win rate | Avg hold (h) | Avg win (bp) | Avg loss (bp) | Profit factor |\n"
+        "## 策略指标\n\n"
+        "| 策略 | 范围 | 槽位 | 收益 | 年化收益 | Sharpe | 当前回撤 | 最大回撤 | 最大回撤修复（天） | 最长回撤（天） | 最长回撤修复（天） | 成交数 | 盈利 | 亏损 | 胜率 | 平均持仓（小时） | 平均盈利（bp） | 平均亏损（bp） | 盈亏比 |\n"
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
         + "\n".join(
             f"| {row['strategy']} | {row['scope']} | {row['slots']:.0f} | {row.get('total_return', float('nan')):+.2%} | "
@@ -368,17 +366,10 @@ def _write_bundle(
             for row in quality_rows
         )
         + "\n\n"
-        "## Interpretation\n\n"
-        "The crypto sleeve uses the current 8-symbol rolling-730 config c, tail 0.01, both directions, "
-        f"10bp cost and {meta['quant_slots']}-slot capacity. The stock sleeve uses the "
-        f"low-drawdown {meta['stock_slots']}-slot rule (600bp dislocation, 300bp stop, "
-        "60-minute resolve, max two entries/day). Crypto trades "
-        "that cross the window boundary are excluded, so this is a fair overlap test.\n\n"
-        f"The fixed {meta['shared_pool_slots']}-slot shared pool returns **{pooled.total_return:+.2%}** with "
-        f"**{pooled.max_drawdown_pct:.2%}** drawdown. The shared-pool table is the "
-        "primary combination result; static rows are reference allocations only.\n\n"
-        "> Research note: the overlap contains only a small number of crypto trades; "
-        "the combined result is exploratory, not a live-performance forecast.\n"
+        "## 说明\n\n"
+        "加密部分使用当前八币 rolling-730、配置 c、尾部分位 0.01、双向信号、10bp 成本和五槽容量。股票部分使用低回撤三槽规则（偏离 600bp、止损 300bp、开盘附近退出、每天最多两次入场）。跨越共同窗口的加密成交会被排除，以保证比较公平。\n\n"
+        f"固定 {meta['shared_pool_slots']} 槽共享池收益 **{pooled.total_return:+.2%}**，最大回撤 **{pooled.max_drawdown_pct:.2%}**。共享池表是组合主结果，静态配置仅作参考。\n\n"
+        "> 研究提示：共同窗口中的加密成交较少，组合结果仍属探索性证据，不能直接当作实盘预测。\n"
     )
     (run_dir / "report.md").write_text(summary, encoding="utf-8")
 
