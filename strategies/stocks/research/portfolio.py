@@ -16,6 +16,59 @@ import numpy as np
 import pandas as pd
 
 
+def _recovery_stats(curve: pd.Series) -> dict:
+    """Return drawdown recovery durations from the realized equity curve.
+
+    The curve is event/exit based, so these figures intentionally describe
+    realized-equity recovery and do not claim to include intrabar floating PnL.
+    """
+    if curve.empty:
+        return {"max_drawdown_recovery_days": np.nan,
+                "longest_drawdown_recovery_days": np.nan,
+                "longest_drawdown_days": np.nan,
+                "unrecovered_drawdown": False}
+    values = curve.sort_index().to_numpy(dtype=float)
+    times = curve.sort_index().index
+    peaks = np.maximum.accumulate(values)
+    active = None
+    episodes = []
+    for i, value in enumerate(values):
+        if active is None and value < peaks[i] * (1 - 1e-12):
+            active = {
+                "peak_ts": times[i - 1] if i else times[i],
+                "peak_value": peaks[i],
+                "trough_ts": times[i],
+                "trough_value": value,
+            }
+        elif active is not None:
+            if value < active["trough_value"]:
+                active["trough_ts"] = times[i]
+                active["trough_value"] = value
+            if value >= active["peak_value"] - 1e-8:
+                episodes.append({
+                    "depth": active["trough_value"] / active["peak_value"] - 1.0,
+                    "recovery_days": (times[i] - active["trough_ts"]).total_seconds() / 86400.0,
+                    "duration_days": (times[i] - active["peak_ts"]).total_seconds() / 86400.0,
+                })
+                active = None
+    if active is not None:
+        deepest = min(episodes, key=lambda e: e["depth"], default=None)
+        return {
+            "max_drawdown_recovery_days": float(deepest["recovery_days"]) if deepest else np.nan,
+            "longest_drawdown_recovery_days": float(max((e["recovery_days"] for e in episodes), default=np.nan)),
+            "longest_drawdown_days": float((times[-1] - active["peak_ts"]).total_seconds() / 86400.0),
+            "unrecovered_drawdown": True,
+        }
+    longest = float(max((e["recovery_days"] for e in episodes), default=np.nan))
+    deepest = min(episodes, key=lambda e: e["depth"], default=None)
+    return {
+        "max_drawdown_recovery_days": float(deepest["recovery_days"]) if deepest else np.nan,
+        "longest_drawdown_recovery_days": longest,
+        "longest_drawdown_days": float(max((e["duration_days"] for e in episodes), default=np.nan)),
+        "unrecovered_drawdown": False,
+    }
+
+
 def simulate(
     trades: pd.DataFrame,
     capital: float = 100_000.0,
@@ -72,6 +125,7 @@ def simulate(
     # 日收益用于夏普。样本只有二十几天，这个夏普的置信区间极宽。
     daily = curve.resample("1D").last().ffill().pct_change().dropna()
 
+    recovery = _recovery_stats(curve)
     return curve, {
         "capital": capital,
         "final_equity": float(equity),
@@ -90,4 +144,5 @@ def simulate(
         "n_trades": int(len(ordered)),
         "sharpe_daily": float(daily.mean() / daily.std() * np.sqrt(252)) if daily.std() > 0 else np.nan,
         "vol_annualized": float(daily.std() * np.sqrt(252)) if len(daily) > 1 else np.nan,
+        **recovery,
     }

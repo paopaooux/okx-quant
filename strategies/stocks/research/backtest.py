@@ -29,6 +29,7 @@ class Rules:
     max_per_day: int = 3
     rank_column: str = "abs_signal"   # 信号排队时按强度取前几名
     resolve_offset_minutes: float = 30.0  # 收敛点之后多久离场
+    direction: str = "both"            # both / long / short
     allow_short: bool = True
     min_trailing_volume: float = 150_000.0
 
@@ -104,20 +105,35 @@ def run(
 
     queue = events.copy()
     queue["abs_signal"] = _signal_strength(queue)
+    # 休市偏离的机制是按偏离幅度排队，而不是按正负号排队。保留一个
+    # 明确的列，避免把有符号 deviation 误当作强度。
+    if "deviation" in queue.columns:
+        queue["abs_deviation"] = queue["deviation"].abs()
     if "trailing_quote_volume_24h" in queue.columns:
         queue = queue.loc[
             queue.trailing_quote_volume_24h.fillna(0) >= rules.min_trailing_volume
         ]
-    if not rules.allow_short:
+    if rules.direction not in {"both", "long", "short"}:
+        raise ValueError("rules.direction must be one of: both, long, short")
+    if rules.direction == "long" or (rules.direction == "both" and not rules.allow_short):
         queue = queue.loc[queue.side > 0]
+    elif rules.direction == "short":
+        queue = queue.loc[queue.side < 0]
     if rules.rank_column in queue.columns and len(queue) > 1:
-        spread = queue.groupby("event_ts")[rules.rank_column].transform("std").fillna(0.0)
-        if float(spread.max()) == 0.0:
+        grouped = queue.groupby("event_ts")[rules.rank_column]
+        multi = grouped.transform("size") > 1
+        spread = grouped.transform("std").fillna(0.0)
+        if multi.any() and float(spread.loc[multi].max()) == 0.0:
             # 排序列在每个时点内没有差异，取前几名等于随机取，而"随机"在
             # pandas 里是稳定的原始顺序，会一直挑同一个标的。
             print(f"[backtest] 警告: 排序列 {rules.rank_column} 在时点内无差异，"
                   f"名额分配退化为固定顺序")
-    queue = queue.sort_values(["event_ts", rules.rank_column], ascending=[True, False])
+    sort_columns = ["event_ts", rules.rank_column]
+    ascending = [True, False]
+    if "inst_id" in queue.columns:
+        sort_columns.append("inst_id")
+        ascending.append(True)
+    queue = queue.sort_values(sort_columns, ascending=ascending)
 
     entry_cost = (config.fee_bps + slippage_bps) / 1e4
     exit_cost = (config.fee_bps + slippage_bps) / 1e4

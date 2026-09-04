@@ -87,8 +87,14 @@ def build_events(
         if move == 0.0 or abs(move) * 1e4 < min_move_bps:
             continue
 
-        entry_position = frame.index.searchsorted(decision, side="right") - 1
-        if entry_position < 0:
+        # Direction is known at `decision`, but the first completed bar after
+        # it is the earliest bar whose close can actually be used for entry.
+        # Using the previous bar here would let the backtest fill before the
+        # observation window had ended (up to one whole bar of look-ahead).
+        entry_position = frame.index.searchsorted(decision, side="left")
+        if entry_position >= len(frame.index):
+            continue
+        if frame.index[entry_position] - decision > max_stale:
             continue
         resolve = sessions.next_open(decision)
         if resolve is None:
