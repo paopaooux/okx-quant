@@ -216,9 +216,16 @@ class DemoClient:
     def balance(self):
         return self._request("GET", "/api/v5/account/balance")
 
-    def order_detail(self, inst_id, ord_id):
+    def order_detail(self, inst_id, ord_id=None, client_order_id=None):
+        params = {"instId": inst_id}
+        if ord_id:
+            params["ordId"] = ord_id
+        elif client_order_id:
+            params["clOrdId"] = client_order_id
+        else:
+            raise ValueError("order lookup requires an exchange or client order ID")
         for attempt in range(5):
-            rows = self._request("GET", "/api/v5/trade/order", params={"instId": inst_id, "ordId": ord_id})
+            rows = self._request("GET", "/api/v5/trade/order", params=params)
             detail = rows[0] if rows else {}
             if detail.get("state") in {"filled", "canceled", "mmp_canceled", "partially_filled"}:
                 return detail
@@ -250,8 +257,10 @@ class DemoClient:
         })
 
     def order(self, inst_id, side, sz, td_mode="isolated", reduce_only=False,
-              quick_mgn_type=None, pos_side=None):
+              quick_mgn_type=None, pos_side=None, client_order_id=None):
         body = {"instId": inst_id, "tdMode": td_mode, "side": side, "ordType": "market", "sz": str(sz)}
+        if client_order_id:
+            body["clOrdId"] = client_order_id
         if reduce_only: body["reduceOnly"] = "true"
         if quick_mgn_type:
             body["quickMgnType"] = quick_mgn_type

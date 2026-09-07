@@ -15,13 +15,13 @@ from pathlib import Path
 import pandas as pd
 
 from strategies.stocks.market.okx import OKXClient, OKXError, update_cache
-from strategies.stocks.market.universe_tech import TECH
+from scripts.live.combination_policy import stock_instruments
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = Path(os.environ.get("AUTO_STOCK_DATA", ROOT / "data" / "stocks_swap"))
 UNIVERSE = Path(os.environ.get("AUTO_STOCK_UNIVERSE", DATA / "universe.csv"))
 INTERVAL = max(60, int(os.environ.get("STOCK_CANDLE_INTERVAL", "300")))
-HISTORY_DAYS = max(2, int(os.environ.get("STOCK_HISTORY_DAYS", "4")))
+HISTORY_DAYS = max(18, int(os.environ.get("STOCK_HISTORY_DAYS", "18")))
 STATUS = Path(os.environ.get("AUTO_STOCK_STATUS", DATA / "data_status.json"))
 
 
@@ -30,11 +30,8 @@ def refresh_candles(client: OKXClient) -> int:
         return 0
     universe = pd.read_csv(UNIVERSE)
     count = failures = 0
-    eligible = universe.loc[
-        (universe.get("kind", "single").astype(str) != "leveraged")
-        & universe.ticker.astype(str).isin(TECH)
-    ]
-    for inst in eligible.instId.dropna().astype(str).unique():
+    eligible = stock_instruments(universe)
+    for inst in eligible:
         try:
             update_cache(client, inst, "5m", HISTORY_DAYS, DATA)
             count += 1
@@ -77,7 +74,9 @@ def run_once(do_candles: bool = True, status: dict | None = None) -> dict:
     if do_candles:
         try:
             count = refresh_candles(OKXClient(timeout=20))
-            status["candles"] = {"last_success_at": stamp, "last_error": None,
+            completed = datetime.now(timezone.utc).isoformat()
+            status["updated_at"] = completed
+            status["candles"] = {"last_success_at": completed, "last_error": None,
                                   "refreshed": count, "latest_bar_at": _latest_candle_ts()}
         except Exception as exc:  # keep the daemon alive across transient outages
             status.setdefault("candles", {}).update({"last_error": str(exc), "last_failed_at": stamp})

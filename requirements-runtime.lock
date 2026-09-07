@@ -1,0 +1,18 @@
+# Versions from the running production image before the policy alignment.
+PyYAML==6.0.3
+certifi==2026.7.22
+charset-normalizer==3.5.1
+cloudpickle==3.1.2
+idna==3.19
+joblib==1.6.0
+lightgbm==4.7.0
+narwhals==2.25.0
+numpy==2.5.2
+pandas==3.0.5
+python-dateutil==2.9.0.post0
+requests==2.34.2
+scikit-learn==1.9.0
+scipy==1.18.1
+six==1.17.0
+threadpoolctl==3.6.0
+urllib3==2.7.0

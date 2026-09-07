@@ -11,16 +11,13 @@ ENV HTTP_PROXY=${HTTP_PROXY} \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
-COPY pyproject.toml requirements.txt ./
+COPY pyproject.toml requirements.txt requirements-runtime.lock ./
+RUN pip install --no-cache-dir --disable-pip-version-check -r requirements-runtime.lock
 COPY scripts ./scripts
 COPY strategies ./strategies
 
-# Install only what the combination backtest needs.  Model training and OKX
-# execution are separate local commands; this image does not start either.
-RUN pip install --no-cache-dir --disable-pip-version-check \
-    "pandas>=2.0,<4" "numpy>=1.26,<3" \
-    "scikit-learn>=1.3,<2" "lightgbm>=4,<5" "PyYAML>=6.0" \
-    .
+# Keep model/runtime versions fixed when deploying a trading-rule change.
+RUN pip install --no-cache-dir --disable-pip-version-check --no-deps .
 
 ENV HTTP_PROXY= \
     HTTPS_PROXY=

@@ -24,9 +24,12 @@ import requests
 from scripts.data import build
 from scripts.live.okx_demo import BASE, SIMULATED_TRADING, DemoClient, save_balance, save_strategy_snapshots
 from strategies.stocks.market import data as stock_data
-from strategies.stocks.market.universe_tech import TECH
+from strategies.stocks.market import sessions as stock_sessions
 from strategies.stocks.config import Config as StockConfig
 from strategies.stocks.research import events as stock_events
+from scripts.live.combination_policy import (
+    POLICY, entry_metadata, entry_rejection, exit_reason, migrate_policy_state, stock_instruments,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA, RESULTS, MODELS = ROOT / "data", ROOT / "results" / "crypto", ROOT / "models"
@@ -63,11 +66,13 @@ DYNAMIC_SIZE = os.environ.get("AUTO_DYNAMIC_SIZE", "true").strip().lower() in {
 }
 INSTRUMENT_CACHE_SECONDS = max(30, int(os.environ.get("AUTO_INSTRUMENT_CACHE_SECONDS", "300")))
 STOCK_SIZE = os.environ.get("AUTO_STOCK_SIZE", "1")
-STOCK_STOP_BPS = float(os.environ.get("AUTO_STOCK_STOP_BPS", "600"))
+STOCK_STOP_BPS = float(os.environ.get("AUTO_STOCK_STOP_BPS", "300"))
 STOCK_MAX_HOLD_HOURS = float(os.environ.get("AUTO_STOCK_MAX_HOLD_HOURS", "30"))
 _last_stock_feed_warning = 0.0
 _instrument_cache: dict[str, dict] = {}
 _instrument_cache_at = 0.0
+_stock_signal_cache_key = None
+_stock_signal_cache: dict[str, dict] = {}
 
 
 def order_pos_side(side: str) -> str | None:
@@ -222,8 +227,8 @@ def load_state() -> dict:
         return {"positions": {}, "last_bar": 0, "trades": 0}
     try:
         return _migrate_state(json.loads(STATE_PATH.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return {"positions": {}, "last_bar": 0, "trades": 0}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Cannot read live state; refusing to forget positions or entry counters") from exc
 
 
 def save_state(state: dict) -> None:
@@ -253,10 +258,7 @@ def remote_positions(client: DemoClient) -> dict[str, dict]:
     # This strategy is contract-only. Do not import spot/margin positions or
     # unrelated manual swaps into the shared pool.
     allowed = _allowed_instruments()
-    try:
-        rows = client.positions("SWAP")
-    except RuntimeError:
-        rows = []
+    rows = client.positions("SWAP")
     for row in rows:
         inst = row.get("instId", "")
         if inst not in allowed:
@@ -276,6 +278,9 @@ def remote_positions(client: DemoClient) -> dict[str, dict]:
         out[position_key(inst, direction)] = {
             "symbol": sym, "inst_id": inst, "side": direction,
             "size": str(abs(pos)), "entry_px": float(row.get("avgPx") or 0),
+            "asset_type": "crypto" if sym in SYMBOLS else "stock",
+            "opened_bar": int(row.get("cTime") or 0),
+            "upl": float(row.get("upl") or 0),
         }
     return out
 
@@ -410,7 +415,8 @@ def build_crypto_signals(data: LiveData) -> dict[str, dict]:
         signals[sym] = {"bar": int(row["ts"]), "side": side, "p_up": p,
                         "close": close, "width": float(row[f"width_{CONFIG}" ]),
                         "strategy": "okx_quant_c", "asset_type": "crypto",
-                        "inst_id": sym.replace("USDT", "-USDT-SWAP")}
+                        "inst_id": sym.replace("USDT", "-USDT-SWAP"),
+                        "missing_features": x.columns[x.isna().iloc[0]].tolist()}
     if signals:
         newest_signal = max(x["bar"] for x in signals.values())
         signal_age = time.time() - newest_signal / 1000.0
@@ -421,31 +427,45 @@ def build_crypto_signals(data: LiveData) -> dict[str, dict]:
 
 def build_stock_signals(now: pd.Timestamp) -> dict[str, dict]:
     """Build stock-perpetual signals from recent OKX off-hours dislocations."""
-    global _last_stock_feed_warning
+    global _last_stock_feed_warning, _stock_signal_cache_key, _stock_signal_cache
     try:
         status = json.loads(STOCK_STATUS.read_text(encoding="utf-8"))
         now_epoch = now.timestamp()
-        updated = pd.Timestamp(status.get("updated_at"), tz="UTC").timestamp()
-        candles_ok = pd.Timestamp(status.get("candles", {}).get("last_success_at"), tz="UTC").timestamp()
+        updated = pd.to_datetime(status.get("updated_at"), utc=True).timestamp()
+        candles_ok = pd.to_datetime(status.get("candles", {}).get("last_success_at"), utc=True).timestamp()
         if min(now_epoch - updated, now_epoch - candles_ok) < -5 or \
                 max(now_epoch - updated, now_epoch - candles_ok) > STOCK_DATA_MAX_AGE:
             raise ValueError("stock feed heartbeat is stale")
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
         if time.time() - _last_stock_feed_warning > STOCK_DATA_MAX_AGE:
             print(f"stock feed unavailable/stale: {STOCK_STATUS}", flush=True)
             _last_stock_feed_warning = time.time()
         return {}
+    cache_key = status.get("updated_at")
+    if cache_key == _stock_signal_cache_key:
+        return {sym: sig for sym, sig in _stock_signal_cache.items()
+                if now - pd.Timestamp(sig["event_ts"]) <= pd.Timedelta(seconds=STOCK_DATA_MAX_AGE)}
     try:
         universe_path = STOCK_DATA / "universe.csv"
         if not universe_path.exists():
             return {}
         universe = pd.read_csv(universe_path)
-        inst_ids = sorted(universe.loc[universe.ticker.astype(str).isin(TECH), "instId"].dropna().unique())
+        inst_ids = stock_instruments(universe)
         ticker_by_inst = universe.set_index("instId")["ticker"].astype(str).to_dict()
         frames = stock_data.to_bar_end(stock_data.load_panel(inst_ids, "5m", STOCK_DATA), "5m")
-        cfg = StockConfig(data_dir=str(STOCK_DATA), result_dir=str(ROOT / "results" / "stocks_swap"))
-        events = stock_events.off_hours_dislocation(frames, cfg)
+        frames = {inst: frame.loc[(frame.index <= now) & (frame.index >= now - pd.Timedelta(days=18))]
+                  for inst, frame in frames.items()}
+        frames = {inst: frame for inst, frame in frames.items() if len(frame) and
+                  now - frame.index[-1] <= pd.Timedelta(seconds=STOCK_DATA_MAX_AGE)}
+        # Calendar look-ahead is known in advance; prices are strictly clipped
+        # to now. Include the next cash open across weekends and holidays.
+        windows = stock_sessions.closed_windows(now - pd.Timedelta(days=8), now + pd.Timedelta(days=8))
+        windows = windows.loc[(windows.close_ts < now) & (windows.open_ts > now)]
+        cfg = StockConfig(dislocation_bps=POLICY.stock_trigger_bps, data_dir=str(STOCK_DATA),
+                          result_dir=str(ROOT / "results" / "stocks_swap"))
+        events = stock_events.off_hours_dislocation(frames, cfg, windows=windows)
         if events.empty:
+            _stock_signal_cache_key, _stock_signal_cache = cache_key, {}
             return {}
         out = {}
         for row in events.sort_values("event_ts").itertuples(index=False):
@@ -453,19 +473,21 @@ def build_stock_signals(now: pd.Timestamp) -> dict[str, dict]:
             # Never enter a position on a stale event after a restart. The
             # event must be newly actionable within one loop window; older
             # events remain useful in the backtest but are not live signals.
-            if event_ts < now - pd.Timedelta(minutes=max(30, INTERVAL * 2)) or event_ts > now:
+            if event_ts < now - pd.Timedelta(seconds=STOCK_DATA_MAX_AGE) or event_ts > now:
                 continue
             inst = str(row.inst_id)
             ticker = ticker_by_inst.get(inst, inst.split("-", 1)[0])
             out[inst] = {
                 "bar": int(event_ts.timestamp() * 1000),
                 "side": "long" if int(row.side) > 0 else "short",
-                "p_up": None, "close": None, "width": STOCK_STOP_BPS / 1e4,
+                "p_up": None, "close": float(frames[inst].loc[event_ts, "close"]),
+                "width": POLICY.stock_stop_bps / 1e4,
                 "strategy": "xstock_hybrid", "asset_type": "stock", "inst_id": inst,
                 "event_ts": event_ts.isoformat(),
                 "ticker": ticker, "resolve_ts": pd.Timestamp(row.resolve_ts).isoformat(),
                 "observe_move_bps": float(abs(row.deviation) * 1e4),
             }
+        _stock_signal_cache_key, _stock_signal_cache = cache_key, out
         return out
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"stock signal build failed: {exc}", flush=True)
@@ -479,21 +501,120 @@ def signal_priority(sig: dict) -> float:
     return abs(float(sig.get("observe_move_bps") or 0.0)) / 10_000.0
 
 
+def reconcile_pending_entries(client, state):
+    state["entry_reconciliation_ok"] = True
+    for client_id, pending in list(state.setdefault("pending_entries", {}).items()):
+        try:
+            detail = client.order_detail(pending["inst_id"], pending.get("ord_id"), client_order_id=client_id)
+        except (requests.RequestException, RuntimeError, ValueError):
+            # An uncertain submission reserves its slot. Never retry it under
+            # a new ID, and do not let an entry lookup disable other exits.
+            state["entry_reconciliation_ok"] = False
+            print(f"ENTRY RECONCILIATION UNKNOWN {pending['inst_id']} client_id={client_id}", flush=True)
+            continue
+        filled = float(detail.get("accFillSz") or detail.get("fillSz") or 0.)
+        if filled > 0:
+            key = position_key(pending["inst_id"], pending["side"])
+            exiting = {k: v for k, v in state["positions"].get(key, {}).items()
+                       if k in {"exit_ord_id", "exit_client_id"}}
+            state["positions"][key] = {**pending, "size": str(filled),
+                                        "entry_px": float(detail.get("avgPx") or pending["entry_px"]), **exiting}
+        if detail.get("state") in {"filled", "canceled", "mmp_canceled"}:
+            state["pending_entries"].pop(client_id)
+            if filled > 0:
+                state["trades"] = int(state.get("trades", 0)) + 1
+        save_state(state)
+
+
+def manage_positions(client, state, data, now, allow_orders):
+    """Exit management does not depend on a fresh entry signal or model run."""
+    tickers = {}
+    for key, pos in list(state["positions"].items()):
+        sym, inst = pos["symbol"], pos["inst_id"]
+        if pos.get("exit_ord_id") or pos.get("exit_client_id"):
+            if not allow_orders:
+                continue
+            try:
+                detail = client.order_detail(inst, pos.get("exit_ord_id"), client_order_id=pos.get("exit_client_id"))
+            except (requests.RequestException, RuntimeError, ValueError):
+                state["entry_reconciliation_ok"] = False
+                print(f"EXIT RECONCILIATION UNKNOWN {sym}", flush=True)
+                continue
+            if detail.get("state") == "filled":
+                state["positions"].pop(key, None)
+                state["trades"] = int(state.get("trades", 0)) + 1
+            elif detail.get("state") in {"canceled", "mmp_canceled"}:
+                pos.pop("exit_ord_id", None)
+                pos.pop("exit_client_id", None)
+            save_state(state)
+            continue
+        try:
+            mark, stamp = data.ticker(sym, pos["asset_type"])
+            if not -5 <= time.time() - stamp / 1000 <= MAX_DATA_AGE:
+                raise RuntimeError("stale execution ticker")
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            print(f"EXIT PRICE UNAVAILABLE {sym}: {type(exc).__name__}", flush=True)
+            continue
+        tickers[sym] = (mark, stamp)
+        reason = exit_reason(pos, mark, now)
+        if not reason or not allow_orders:
+            continue
+        client_id = uuid.uuid4().hex
+        pos["exit_client_id"] = client_id
+        save_state(state)
+        try:
+            result = client.order(inst, "sell" if pos["side"] == "long" else "buy", pos["size"],
+                                  "isolated", True, pos_side=order_pos_side(pos["side"]), client_order_id=client_id)
+            pos["exit_ord_id"] = result[0].get("ordId") if result else None
+            save_state(state)
+            detail = client.order_detail(inst, pos.get("exit_ord_id"), client_order_id=client_id)
+        except (requests.RequestException, RuntimeError, ValueError):
+            state["entry_reconciliation_ok"] = False
+            print(f"EXIT SUBMISSION UNKNOWN {sym} client_id={client_id}", flush=True)
+            continue
+        if detail.get("state") == "filled":
+            state["positions"].pop(key, None)
+            state["trades"] = int(state.get("trades", 0)) + 1
+            print(f"EXIT {sym} reason={reason} policy={pos.get('policy_version')}", flush=True)
+        elif detail.get("state") in {"canceled", "mmp_canceled"}:
+            pos.pop("exit_ord_id", None)
+            pos.pop("exit_client_id", None)
+        save_state(state)
+    return tickers
+
+
 def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
     state = _migrate_state(state)
     data = LiveData(client.s)
     now = pd.Timestamp.now(tz="UTC")
-    signals = build_crypto_signals(data)
-    signals.update(build_stock_signals(now))
     # Reconcile before constructing tickers/signals so a position discovered
     # after a restart is still managed even when its original stock event has
     # left the current candle window.
+    if allow_orders:
+        reconcile_pending_entries(client, state)
     remote = remote_positions(client)
+    pending_instruments = {p["inst_id"] for p in state.get("pending_entries", {}).values()}
     for key in list(state["positions"]):
-        if key not in remote:
+        if key not in remote and state["positions"][key]["inst_id"] not in pending_instruments:
             state["positions"].pop(key, None)
     for key, pos in remote.items():
-        state["positions"].setdefault(key, {**pos, "opened_bar": 0, "width": 0.0})
+        if key in state["positions"]:
+            state["positions"][key].update(size=pos["size"], upl=pos["upl"])
+        else:
+            pending = next((p for p in state.get("pending_entries", {}).values()
+                            if p["inst_id"] == pos["inst_id"] and p["side"] == pos["side"]), {})
+            state["positions"][key] = {**pos, "width": .06 if pos["asset_type"] == "stock" else 0.,
+                                        **pending, "size": pos["size"], "entry_px": pos["entry_px"], "upl": pos["upl"]}
+    migrate_policy_state(state, now)
+    if allow_orders:
+        save_state(state)
+    managed_tickers = manage_positions(client, state, data, now, allow_orders)
+    signals = {}
+    try:
+        signals.update(build_crypto_signals(data))
+    except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+        print(f"CRYPTO ENTRIES UNAVAILABLE: {type(exc).__name__}", flush=True)
+    signals.update(build_stock_signals(pd.Timestamp.now(tz="UTC")))
     # Continue managing a live position after its original stock event leaves
     # the current candle window.
     for key, pos in state.get("positions", {}).items():
@@ -506,6 +627,7 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
                 "strategy": pos.get("strategy", "xstock_hybrid"),
                 "asset_type": pos.get("asset_type", "stock"),
                 "inst_id": pos.get("inst_id", sym),
+                "management_only": True,
             }
     # A closed-bar signal is deliberately separate from the live execution
     # price. Stops and timeouts must react to the OKX market now, not to the
@@ -517,7 +639,8 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
         if pos.get("symbol") not in ticker_symbols and pos.get("inst_id") not in ticker_symbols
     )
     ticker_symbols = list(dict.fromkeys(s for s in ticker_symbols if s))
-    tickers = {sym: data.ticker(sym, signals.get(sym, {}).get("asset_type", "crypto")) for sym in ticker_symbols}
+    tickers = {sym: managed_tickers[sym] if sym in managed_tickers else
+               data.ticker(sym, signals.get(sym, {}).get("asset_type", "crypto")) for sym in ticker_symbols}
     now_ms = int(time.time() * 1000)
     for sym, (_, ts) in tickers.items():
         if now_ms - ts > MAX_DATA_AGE * 1000:
@@ -527,62 +650,26 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
     balance = client.balance()
     save_balance(balance)
     total_eq = balance[0].get("totalEq") if balance else None
+    # Match the backtest's realized-equity sizing instead of compounding open
+    # PNL into subsequent entries. Actual fees/funding remain account costs.
+    sizing_eq = float(total_eq or 0.) - sum(float(p.get("upl") or 0.) for p in state["positions"].values())
     cycle_id = uuid.uuid4().hex
-    # Existing positions are handled first. New signals then compete for the
-    # shared pool by current signal strength; no asset-class quota is imposed.
-    def has_position(sym: str) -> bool:
-        return any(pos.get("symbol") == sym for pos in state["positions"].values())
-
     ordered_signals = sorted(
         signals.items(),
-        key=lambda item: (not has_position(item[0]), -signal_priority(item[1]), item[0]),
+        key=lambda item: (item[1]["bar"], -signal_priority(item[1]),
+                          item[1].get("strategy", ""), item[0]),
     )
     for sym, sig in ordered_signals:
         inst = sig.get("inst_id") or sym.replace("USDT", "-USDT-SWAP")
-        matching = [
-            (key, pos) for key, pos in state["positions"].items()
-            if pos.get("symbol") == sym or pos.get("inst_id") == inst
-        ]
-        for key, pos in matching:
-            if pos.get("exit_ord_id"):
-                detail = client.order_detail(inst, str(pos["exit_ord_id"])) if allow_orders else {}
-                if detail.get("state") == "filled":
-                    state["positions"].pop(key, None)
-                    state["trades"] = int(state.get("trades", 0)) + 1
-                elif detail.get("state") in {"canceled", "mmp_canceled"}:
-                    pos.pop("exit_ord_id", None)
-                continue
-            bars = max(0, (sig["bar"] - int(pos.get("opened_bar") or sig["bar"])) // BAR_MS)
-            entry, width = float(pos.get("entry_px") or sig.get("close") or tickers[sym][0]), float(pos.get("width") or sig["width"])
-            mark = tickers[sym][0]
-            stop = entry * (1 - width) if pos["side"] == "long" else entry * (1 + width)
-            take = entry * (1 + width) if pos["side"] == "long" else entry * (1 - width)
-            hit = (mark <= stop or mark >= take) if pos["side"] == "long" else (mark >= stop or mark <= take)
-            max_bars = MAX_HOLD_BARS if sig.get("asset_type") == "crypto" else int(STOCK_MAX_HOLD_HOURS * 4)
-            if allow_orders and (hit or bars >= max_bars):
-                side = "sell" if pos["side"] == "long" else "buy"
-                # Tokenized stocks and crypto are both OKX perpetual contracts
-                # in this strategy. Use isolated contract margin on both sides.
-                td_mode = "isolated"
-                quick_mgn_type = None
-                result = client.order(inst, side, pos.get("size", SIZE), td_mode, True,
-                                      quick_mgn_type, pos_side=order_pos_side(pos["side"]))
-                ord_id = result[0].get("ordId") if result else ""
-                detail = client.order_detail(inst, ord_id) if ord_id else {}
-                if detail.get("state") == "filled":
-                    state["positions"].pop(key, None)
-                    state["trades"] = int(state.get("trades", 0)) + 1
-                    print(f"EXIT {sym} strategy={pos.get('strategy', sig.get('strategy'))} side={pos['side']} mark={mark:.8g} bars={bars} hit={hit}", flush=True)
-                elif detail.get("state") in {"canceled", "mmp_canceled"}:
-                    pos.pop("exit_ord_id", None)
-                else:
-                    # Do not remove the state or open an opposite net order
-                    # until OKX confirms that this close has filled.
-                    pos["exit_ord_id"] = ord_id
-                    print(f"EXIT PENDING {sym} side={pos['side']} ord={ord_id} state={detail.get('state', 'submitted')}", flush=True)
-                    continue
         bar_key = position_key(inst, sig["side"]) if sig["side"] in {"long", "short"} else sym
-        if sig["side"] == "flat" or sig["bar"] <= int(last_bars.get(bar_key, 0)):
+        if sig.get("management_only") or sig["side"] == "flat" or sig["bar"] <= int(last_bars.get(bar_key, 0)):
+            continue
+        last_bars[bar_key] = sig["bar"]
+        reason = entry_rejection(state, sig, pd.Timestamp.now(tz="UTC"))
+        if reason:
+            print(f"ENTRY SKIP {sym}: {reason}", flush=True)
+            continue
+        if not state.get("entry_reconciliation_ok", True):
             continue
         entry_key = position_key(inst, sig["side"])
         if entry_key in state["positions"]:
@@ -594,7 +681,7 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
             continue
         if allow_orders and len(state["positions"]) < MAX_POSITIONS:
             side = "buy" if sig["side"] == "long" else "sell"
-            size = size_for_signal(client, sig, tickers[sym][0], total_eq, specs)
+            size = size_for_signal(client, sig, tickers[sym][0], sizing_eq, specs)
             if not size:
                 print(f"ENTRY SKIP {sym}: no valid contract size for equity={total_eq}", flush=True)
                 continue
@@ -602,19 +689,38 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
             # modes would turn this into a different execution strategy.
             td_mode = "isolated"
             quick_mgn_type = None
+            client_id = uuid.uuid4().hex
+            pending = {"symbol": sym, "inst_id": inst, "side": sig["side"], "size": size,
+                       "entry_px": tickers[sym][0], "width": sig["width"],
+                       "strategy": sig.get("strategy"), "asset_type": sig["asset_type"], **entry_metadata(sig)}
+            if pd.Timestamp(pending["deadline_ts"]) <= pd.Timestamp.now(tz="UTC"):
+                continue
+            if sig["asset_type"] == "stock":
+                day = str(pd.Timestamp.now(tz="UTC").date())
+                ledger = state.setdefault("stock_entries_by_day", {})
+                ledger[day] = ledger.get(day, 0) + 1
+            state["pending_entries"][client_id] = pending
+            save_state(state)
             result = client.order(inst, side, size, td_mode, False, quick_mgn_type,
-                                  pos_side=order_pos_side(sig["side"]))
+                                  pos_side=order_pos_side(sig["side"]), client_order_id=client_id)
             ord_id = result[0].get("ordId") if result else ""
-            detail = client.order_detail(inst, ord_id) if ord_id else {}
+            pending["ord_id"] = ord_id
+            save_state(state)
+            detail = client.order_detail(inst, ord_id, client_order_id=client_id)
             if detail.get("state") == "filled":
-                state["positions"][entry_key] = {"symbol": sym, "inst_id": inst, "side": sig["side"], "size": size,
-                                           "entry_px": float(detail.get("avgPx") or sig.get("close") or tickers[sym][0]),
-                                           "width": sig["width"], "opened_bar": sig["bar"], "ord_id": ord_id,
-                                           "strategy": sig.get("strategy"), "asset_type": sig.get("asset_type")}
+                state["positions"][entry_key] = {**pending,
+                    "size": str(detail.get("accFillSz") or size),
+                    "entry_px": float(detail.get("avgPx") or tickers[sym][0])}
+                state["pending_entries"].pop(client_id, None)
                 state["trades"] = int(state.get("trades", 0)) + 1
                 p_text = f"{sig['p_up']:.5f}" if sig.get("p_up") is not None else "n/a"
                 print(f"ENTRY {sym} strategy={sig.get('strategy')} side={sig['side']} p={p_text} ord={ord_id}", flush=True)
+            elif detail.get("state") in {"canceled", "mmp_canceled"} and not float(detail.get("accFillSz") or 0):
+                state["pending_entries"].pop(client_id, None)
+            save_state(state)
     for sym, sig in signals.items():
+        if sig.get("management_only"):
+            continue
         inst = sig.get("inst_id") or sym.replace("USDT", "-USDT-SWAP")
         key = position_key(inst, sig["side"]) if sig.get("side") in {"long", "short"} else sym
         last_bars[key] = max(int(last_bars.get(key, 0)), int(sig.get("bar") or 0))
@@ -643,7 +749,9 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
                 "position_side": side, "position_size": pos.get("size"), "entry_px": entry or None,
                 "width": width or None,
                 "stop_px": (entry * (1 - width) if side == "long" else entry * (1 + width)) if side and entry and width else None,
-                "take_px": (entry * (1 + width) if side == "long" else entry * (1 - width)) if side and entry and width else None,
+                "take_px": ((entry * (1 + float(pos.get("take_width", width)))) if side == "long" else
+                            (entry * (1 - float(pos.get("take_width", width)))))
+                            if side and entry and float(pos.get("take_width", width)) else None,
                 "total_eq": total_eq,
                 "raw_json": json.dumps({"signal": sig, "position": pos}, ensure_ascii=True),
             })
@@ -661,8 +769,7 @@ def main() -> None:
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--observe", action="store_true", help="never send orders")
     args = ap.parse_args()
-    if CONFIG != "c" or abs(TAIL - 0.01) > 1e-9:
-        print(f"warning: non-default strategy config={CONFIG} tail={TAIL}", flush=True)
+    validate_combination_config()
     client = DemoClient()
     position_mode = validate_position_mode(client)
     state = load_state()
@@ -673,6 +780,7 @@ def main() -> None:
           f"dynamic_size={DYNAMIC_SIZE} position_mode={position_mode} "
           f"max_data_age={MAX_DATA_AGE}s "
           f"price_source=OKX metrics_source=OKX simulated_header={int(SIMULATED_TRADING)}", flush=True)
+    print("COMBINATION_POLICY " + json.dumps(POLICY.manifest(), sort_keys=True), flush=True)
     while True:
         try:
             run_once(client, state, allow)
@@ -681,6 +789,16 @@ def main() -> None:
         if args.once:
             return
         time.sleep(INTERVAL)
+
+
+def validate_combination_config():
+    actual = (CONFIG, TAIL, MODEL_TAG, MAX_POSITIONS, SLOT_WEIGHT, DYNAMIC_SIZE,
+              STOCK_STOP_BPS, STOCK_MAX_HOLD_HOURS, MAX_HOLD_BARS, POSITION_MODE)
+    expected = (POLICY.crypto_config, POLICY.crypto_tail, "c_roll730", POLICY.shared_slots,
+                POLICY.slot_weight, True, POLICY.stock_stop_bps, POLICY.stock_max_hours,
+                POLICY.crypto_horizon_bars, "net_mode")
+    if actual != expected:
+        raise RuntimeError(f"Execution configuration differs from frozen combination: {actual!r} != {expected!r}")
 
 
 if __name__ == "__main__":

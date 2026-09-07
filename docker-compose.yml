@@ -47,10 +47,12 @@ services:
       AUTO_POSITION_MODE: "net_mode"
       AUTO_INTERVAL: "30"
       AUTO_MAX_HOLD_BARS: "48"
+      AUTO_STOCK_STOP_BPS: "300"
+      AUTO_STOCK_MAX_HOLD_HOURS: "30"
       OKX_DEMO_DB: /app/data/okx_demo.sqlite3
       AUTO_STOCK_DATA: /app/data/stocks_swap
       STOCK_CANDLE_INTERVAL: "300"
-      STOCK_HISTORY_DAYS: "4"
+      STOCK_HISTORY_DAYS: "18"
       OKX_CRYPTO_HISTORY_DAYS: "30"
       OKX_CRYPTO_INTERVAL: "60"
     volumes:
