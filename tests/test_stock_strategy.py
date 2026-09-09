@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from strategies.stocks.config import Config
-from strategies.stocks.research.backtest import Rules, run
+from strategies.stocks.research.backtest import Rules, run, summarize_trades
 from strategies.stocks.research.stock_categories import classify_universe, validate_categories
 
 
@@ -50,3 +51,21 @@ def test_backtest_direction_filters_sides():
     short_trades = run(events, {"XTEST-USDT": frame}, cfg, Rules(**common, direction="short")).trades
     assert long_trades.side.tolist() == [1]
     assert short_trades.side.tolist() == [-1]
+
+
+def test_trade_summary_reports_significance_and_direction_contributions():
+    ts = pd.date_range("2026-01-01", periods=4, freq="D", tz="UTC")
+    trades = pd.DataFrame({
+        "net": [0.10, 0.20, -0.05, 0.15],
+        "pnl": [0.10, 0.20, -0.05, 0.15],
+        "side": [1, 1, -1, -1],
+        "entry_ts": ts,
+        "exit_ts": ts,
+        "hold_hours": [1.0] * 4,
+        "reason": ["deadline"] * 4,
+    })
+    summary = summarize_trades(trades, Rules())
+    assert summary["sqn"] > 0
+    assert 0 <= summary["mean_profit_pvalue"] <= 1
+    assert summary["long_profit_pct"] == pytest.approx(30.0)
+    assert summary["short_profit_pct"] == pytest.approx(10.0)

@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from strategies.trade_metrics import METRIC_NOTE
 from strategies.stocks.config import Config
 from strategies.stocks.market import data
 from strategies.stocks.market.universe_tech import TECH
@@ -118,6 +119,10 @@ def main() -> int:
                 "unrecovered_drawdown": metrics.get("unrecovered_drawdown", False),
                 "sharpe_daily": metrics.get("sharpe_daily", float("nan")),
                 "avg_net_bps": stats.get("avg_net_bps", float("nan")),
+                "sqn": stats.get("sqn", float("nan")),
+                "mean_profit_pvalue": stats.get("mean_profit_pvalue", float("nan")),
+                "long_profit_pct": stats.get("long_profit_pct", float("nan")),
+                "short_profit_pct": stats.get("short_profit_pct", float("nan")),
                 "win_rate": stats.get("win_rate", float("nan")),
                 "avg_hold_hours": stats.get("avg_hold_hours", float("nan")),
                 "median_hold_hours": float(result.trades.hold_hours.median()) if not result.trades.empty else float("nan"),
@@ -133,6 +138,7 @@ def main() -> int:
     universe.to_csv(result_dir / "universe_categories.csv", index=False)
     pd.DataFrame(rows).to_csv(result_dir / "summary.csv", index=False)
     metadata = {
+        "trade_metrics_note": METRIC_NOTE,
         "data_dir": str(data_dir),
         "pool": args.pool,
         "category": args.category,

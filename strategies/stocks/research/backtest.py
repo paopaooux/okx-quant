@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+from strategies.trade_metrics import trade_metrics
 
 from ..config import Config
 
@@ -101,7 +102,7 @@ def run(
     rules = rules or Rules()
     slippage_bps = config.slippage_bps if slippage_bps is None else slippage_bps
     if events.empty:
-        return Result(pd.DataFrame(), {"n_trades": 0})
+        return Result(pd.DataFrame(), summarize_trades(pd.DataFrame(), rules))
 
     queue = events.copy()
     queue["abs_signal"] = _signal_strength(queue)
@@ -219,7 +220,7 @@ def summarize_trades(trades: pd.DataFrame, rules: Rules) -> dict:
     单笔净期望才是能外推的东西。
     """
     if trades.empty:
-        return {"n_trades": 0}
+        return {"n_trades": 0, **trade_metrics(trades)}
     net = trades["net"]
     wins, losses = net[net > 0], net[net <= 0]
     equity = equity_curve(trades)
@@ -240,6 +241,7 @@ def summarize_trades(trades: pd.DataFrame, rules: Rules) -> dict:
         "avg_loss_bps": float(losses.mean() * 1e4) if len(losses) else 0.0,
         "profit_factor": float(wins.sum() / abs(losses.sum())) if len(losses) and losses.sum() != 0 else np.inf,
         "expectancy_bps": float(net.mean() * 1e4),
+        **trade_metrics(trades),
         "total_pnl": float(trades.pnl.sum()),
         "max_drawdown": float(drawdown.min()) if len(drawdown) else 0.0,
         # 按日均收益算的年化夏普，仅用于横向比较不同规则，不做绝对解读。

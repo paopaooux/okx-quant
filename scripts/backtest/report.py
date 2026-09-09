@@ -17,6 +17,7 @@ import pandas as pd
 from datetime import datetime, timezone
 from pathlib import Path
 
+from strategies.trade_metrics import METRIC_NOTE
 from scripts.data import build
 from scripts.backtest import backtest_dir as bd
 from scripts.backtest import portfolio
@@ -45,7 +46,7 @@ def file_fingerprint(paths: list[Path]) -> str:
 strategy_files = [Path(__file__), ROOT / "scripts" / "backtest" / "backtest_dir.py",
                   ROOT / "scripts" / "backtest" / "portfolio.py",
                   ROOT / "scripts" / "data" / "build.py",
-                  ROOT / "scripts" / "modeling" / "train.py",
+                  ROOT / "strategies" / "trade_metrics.py",
                   ROOT / "scripts" / "modeling" / "train_dir.py"]
 strategy_fingerprint = file_fingerprint(strategy_files)
 input_files = [RESULTS / f"oos_dir_{cfg}.csv.gz"
@@ -72,6 +73,7 @@ yrs = {c: (o.dt.max() - o.dt.min()).total_seconds() / (365.25 * 86400)
 # Keep the provenance next to the numbers.  These are deliberately explicit:
 # a result copied out of results/ must still say what was tested.
 meta = {
+    "trade_metrics_note": METRIC_NOTE,
     "run_id": run_id,
     "generated_at_utc": datetime.now(timezone.utc).isoformat(),
     "strategy_fingerprint": strategy_fingerprint,
@@ -122,6 +124,10 @@ for cfg, tl, pol in CELLS:
         rows.append({"cfg": cfg, "tail": tl, "policy": pol, "cost": cost,
                      **s, **{f"pf_{k}": v for k, v in p.items()}})
 report = pd.DataFrame(rows)
+print("\n=== 显著性与多空盈利 ===")
+print(report[["cfg", "tail", "cost", "sqn", "mean_profit_pvalue",
+              "long_profit_pct", "short_profit_pct"]].to_string(index=False))
+print(METRIC_NOTE)
 for key, value in meta.items():
     if key not in report.columns:
         report[key] = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value

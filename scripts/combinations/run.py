@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from strategies.stocks.research import portfolio
+from strategies.trade_metrics import METRIC_NOTE, trade_metrics
 
 BAR_MINUTES = 15
 # Primary paper-trading universe from docs/给后续LLM的研究上下文.md.
@@ -191,6 +192,7 @@ def _stats(curve: pd.Series, trades: pd.DataFrame, days: pd.DatetimeIndex) -> di
     span_days = max((days[-1] - days[0]).total_seconds() / 86400.0, 1.0)
     recovery = portfolio._recovery_stats(curve)
     return {
+        **trade_metrics(trades),
         "return_basis": "sample_interval_cumulative",
         "sample_days": span_days,
         "total_return": total,
@@ -232,12 +234,13 @@ def _stats(curve: pd.Series, trades: pd.DataFrame, days: pd.DatetimeIndex) -> di
 def _trade_quality(trades: pd.DataFrame) -> dict:
     """Outcome-focused metrics for the component strategy list."""
     if trades.empty:
-        return {"n_trades": 0, "wins": 0, "losses": 0, "win_rate": np.nan,
+        return {**trade_metrics(trades), "n_trades": 0, "wins": 0, "losses": 0, "win_rate": np.nan,
                 "avg_win_bps": np.nan, "avg_loss_bps": np.nan,
                 "profit_factor": np.nan, "avg_hold_hours": np.nan}
     wins = trades.loc[trades.net > 0, "net"]
     losses = trades.loc[trades.net <= 0, "net"]
     return {
+        **trade_metrics(trades),
         "n_trades": len(trades), "wins": len(wins), "losses": len(losses),
         "trade_count": len(trades),
         "win_rate": float((trades.net > 0).mean()),
@@ -290,6 +293,7 @@ def _write_bundle(
     for _, report in reports.loc[reports["mode"] == "pooled"].iterrows():
         quality_rows.append({
             "strategy": report.scope, "scope": "shared_pool", "slots": report.pool_slots,
+            **{field: report[field] for field in ("sqn", "mean_profit_pvalue", "long_profit_pct", "short_profit_pct")},
             "total_return": report.total_return, "annualized_return": report.annualized_return,
             "sharpe_daily": report.sharpe_daily, "current_drawdown_pct": report.current_drawdown_pct,
             "n_trades": report.n_trades, "wins": report.wins, "losses": report.losses,
@@ -303,7 +307,7 @@ def _write_bundle(
             "longest_drawdown_recovery_days": report.longest_drawdown_recovery_days,
         })
     pd.DataFrame(quality_rows).to_csv(run_dir / "strategy_metrics.csv", index=False)
-    meta = {**meta, "run_id": run_id, "generated_at_utc": generated.isoformat()}
+    meta = {**meta, "trade_metrics_note": METRIC_NOTE, "run_id": run_id, "generated_at_utc": generated.isoformat()}
     (run_dir / "report_meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
@@ -366,6 +370,15 @@ def _write_bundle(
             for row in quality_rows
         )
         + "\n\n"
+        "## 显著性与多空盈利\n\n"
+        "| 策略 | SQN（净收益率） | Mean profit p-value（双侧） | 做多盈利（%） | 做空盈利（%） |\n"
+        "|---|---:|---:|---:|---:|\n"
+        + "\n".join(
+            f"| {row['strategy']} | {row['sqn']:.2f} | {row['mean_profit_pvalue']:.6g} | "
+            f"{row['long_profit_pct']:+.2f}% | {row['short_profit_pct']:+.2f}% |"
+            for row in quality_rows
+        )
+        + "\n\n" + METRIC_NOTE + "\n\n"
         "## 说明\n\n"
         "加密部分使用当前八币 rolling-730、配置 c、尾部分位 0.01、双向信号、10bp 成本和五槽容量。股票部分使用低回撤三槽规则（偏离 600bp、止损 300bp、开盘附近退出、每天最多两次入场）。跨越共同窗口的加密成交会被排除，以保证比较公平。\n\n"
         f"固定 {meta['shared_pool_slots']} 槽共享池收益 **{pooled.total_return:+.2%}**，最大回撤 **{pooled.max_drawdown_pct:.2%}**。共享池表是组合主结果，静态配置仅作参考。\n\n"

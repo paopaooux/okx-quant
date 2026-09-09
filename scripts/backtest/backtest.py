@@ -85,8 +85,10 @@ def simulate(df: pd.DataFrame, cfg: str, cut_long: float, cut_short: float,
 
 
 def summarise(tr: pd.DataFrame, years: float) -> dict:
+    from strategies.trade_metrics import trade_metrics
+
     if tr.empty:
-        return dict(trades=0)
+        return dict(trades=0, **trade_metrics(tr))
     n = len(tr)
     net = tr["net"].to_numpy()
     per_year = n / years
@@ -94,6 +96,7 @@ def summarise(tr: pd.DataFrame, years: float) -> dict:
     dd = float((eq / np.maximum.accumulate(eq) - 1).min())
     sd = net.std(ddof=1)
     return dict(
+        **trade_metrics(tr),
         trades=n,
         per_month=n / (years * 12),
         winrate=float((net > 0).mean()),
