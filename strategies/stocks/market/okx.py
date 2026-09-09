@@ -203,6 +203,8 @@ def update_cache(
     path = Path(data_dir) / bar / f"{inst_id}.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
     requested_start = int((datetime.now(timezone.utc).timestamp() - days * 86400) * 1000)
+    bar_ms = {"1m": 60_000, "3m": 180_000, "5m": 300_000,
+              "15m": 900_000, "30m": 1_800_000, "1H": 3_600_000}.get(bar, 300_000)
     start_ms = requested_start
     old = None
     if path.exists():
@@ -211,13 +213,19 @@ def update_cache(
             old_start_ms = int(pd.to_datetime(old.ts.min(), utc=True).timestamp() * 1000)
             old_end_ms = int(pd.to_datetime(old.ts.max(), utc=True).timestamp() * 1000)
             if requested_start >= old_start_ms:
-                # 已经覆盖到要求的起点，只补尾部，重叠两天修边界。
-                start_ms = max(requested_start, old_end_ms - 2 * 86400 * 1000)
+                # 已经覆盖到要求的起点，只请求尾部并重叠最后一根已确认
+                # K 线。history-candles 只保留 confirm=1，因此不会引入
+                # 未完成 bar；重叠用于修复交易所刚确认的最新 bar。
+                start_ms = max(requested_start, old_end_ms - bar_ms)
     fresh = client.history_candles(inst_id, bar, start_ms, max_pages)
     if old is not None:
         fresh = pd.concat([old, fresh], ignore_index=True)
     fresh["ts"] = pd.to_datetime(fresh["ts"], utc=True)
     fresh = fresh.drop_duplicates("ts", keep="last").sort_values("ts")
+    # Keep the configured rolling window bounded even when the process has
+    # been offline longer than `days`.
+    floor = pd.to_datetime(requested_start, unit="ms", utc=True)
+    fresh = fresh.loc[fresh["ts"] >= floor].reset_index(drop=True)
     # 研究脚本可能与刷新并发运行，先写完整的兄弟文件再原子替换。
     temporary = path.with_suffix(path.suffix + ".tmp")
     fresh.to_csv(temporary, index=False)

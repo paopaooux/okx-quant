@@ -240,6 +240,25 @@ class DemoClient:
         """Return account-level position mode and margin configuration."""
         return self._request("GET", "/api/v5/account/config")
 
+    def ensure_unleveraged(self, inst_id):
+        """Require 1x isolated leverage for a net-mode swap; verify after setting."""
+        params = {"instId": inst_id, "mgnMode": "isolated"}
+
+        def verified(rows):
+            matching = [r for r in rows if r.get("instId") == inst_id
+                        and r.get("mgnMode") == "isolated"
+                        and r.get("posSide") in (None, "", "net")]
+            return bool(matching) and all(float(r.get("lever") or 0) == 1 for r in matching)
+
+        rows = self._request("GET", "/api/v5/account/leverage-info", params=params)
+        if verified(rows):
+            return
+        self._request("POST", "/api/v5/account/set-leverage",
+                      body={**params, "lever": "1"})
+        rows = self._request("GET", "/api/v5/account/leverage-info", params=params)
+        if not verified(rows):
+            raise RuntimeError(f"Cannot verify 1x isolated leverage for {inst_id}")
+
     def fills(self):
         return self._request("GET", "/api/v5/trade/fills", params={"instType": "SWAP", "limit": "100"})
 

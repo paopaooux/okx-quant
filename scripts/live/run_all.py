@@ -20,6 +20,7 @@ COMMANDS = {
     "crypto-data": [sys.executable, "scripts/data/update_okx_crypto.py"],
     "demo": [sys.executable, "-m", "scripts.live.auto_demo"],
 }
+DATA_PROXY = os.environ.get("OKX_DATA_PROXY_URL", "").strip()
 
 
 def stream(name: str, pipe) -> None:
@@ -51,9 +52,14 @@ def main() -> None:
                 if child is not None:
                     print(f"[{name}] exited rc={child.returncode}; restarting", flush=True)
                     time.sleep(2)
+                child_env = os.environ.copy()
+                if DATA_PROXY and name in {"stock-data", "crypto-data"}:
+                    child_env["OKX_PROXY_URL"] = DATA_PROXY
+                    child_env["HTTPS_PROXY"] = DATA_PROXY
+                    child_env["HTTP_PROXY"] = DATA_PROXY
                 child = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE,
                                          stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                         env=os.environ.copy())
+                                         env=child_env)
                 children[name] = child
                 threading.Thread(target=stream, args=(name, child.stdout), daemon=True).start()
             time.sleep(1)

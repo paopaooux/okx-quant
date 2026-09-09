@@ -50,6 +50,7 @@ services:
       AUTO_STOCK_STOP_BPS: "300"
       AUTO_STOCK_MAX_HOLD_HOURS: "30"
       OKX_DEMO_DB: /app/data/okx_demo.sqlite3
+      OKX_DATA_PROXY_URL: ${OKX_DATA_PROXY_URL:-http://127.0.0.1:7893}
       AUTO_STOCK_DATA: /app/data/stocks_swap
       STOCK_CANDLE_INTERVAL: "300"
       STOCK_HISTORY_DAYS: "18"

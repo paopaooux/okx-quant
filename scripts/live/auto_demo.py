@@ -13,7 +13,7 @@ import json
 import os
 import time
 import uuid
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN
 from pathlib import Path
 
 import lightgbm as lgb
@@ -317,7 +317,8 @@ def _format_size(size: Decimal, lot: Decimal) -> str:
 
 
 def size_for_signal(client: DemoClient, sig: dict, mark: float,
-                    total_eq: object, specs: dict[str, dict]) -> str | None:
+                    total_eq: object, specs: dict[str, dict], *,
+                    round_up: bool = True) -> str | None:
     """Return an OKX-lot-aligned size for one shared-pool slot.
 
     A configured fixed size is an opt-in fallback for read-only tests. Live
@@ -343,7 +344,11 @@ def size_for_signal(client: DemoClient, sig: dict, mark: float,
     if lot <= 0:
         lot = minimum if minimum > 0 else Decimal("1")
     target = equity * _decimal(str(SLOT_WEIGHT)) / contract_notional
-    size = (target / lot).to_integral_value(rounding=ROUND_DOWN) * lot
+    # Most entries round up so coarse contract lots do not silently turn a
+    # 20% slot into a 13% slot. The final empty slot rounds down to preserve
+    # the shared-pool equity cap after earlier lots have rounded upward.
+    rounding = ROUND_CEILING if round_up else ROUND_DOWN
+    size = (target / lot).to_integral_value(rounding=rounding) * lot
     if size < minimum:
         return None
     return _format_size(size, lot)
@@ -609,6 +614,15 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
     if allow_orders:
         save_state(state)
     managed_tickers = manage_positions(client, state, data, now, allow_orders)
+    # Exits always run first. An unsuccessful leverage repair blocks entries,
+    # while the next cycle can still close positions normally.
+    if allow_orders:
+        for inst in sorted({p["inst_id"] for p in state["positions"].values()}):
+            try:
+                client.ensure_unleveraged(inst)
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                state["entry_reconciliation_ok"] = False
+                print(f"LEVERAGE CHECK FAILED {inst}: {exc}", flush=True)
     signals = {}
     try:
         signals.update(build_crypto_signals(data))
@@ -679,9 +693,14 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
         # the existing state entry.
         if any(pos.get("inst_id") == inst for pos in state["positions"].values()):
             continue
-        if allow_orders and len(state["positions"]) < MAX_POSITIONS:
+        active_count = len(state["positions"]) + len(state.get("pending_entries", {}))
+        if allow_orders and active_count < MAX_POSITIONS:
             side = "buy" if sig["side"] == "long" else "sell"
-            size = size_for_signal(client, sig, tickers[sym][0], sizing_eq, specs)
+            # Round up for ordinary slots; use the remaining slot as the
+            # conservative cap so aggregate lots cannot exceed one account.
+            final_empty_slot = active_count == MAX_POSITIONS - 1
+            size = size_for_signal(client, sig, tickers[sym][0], sizing_eq, specs,
+                                   round_up=not final_empty_slot)
             if not size:
                 print(f"ENTRY SKIP {sym}: no valid contract size for equity={total_eq}", flush=True)
                 continue
@@ -694,6 +713,13 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
                        "entry_px": tickers[sym][0], "width": sig["width"],
                        "strategy": sig.get("strategy"), "asset_type": sig["asset_type"], **entry_metadata(sig)}
             if pd.Timestamp(pending["deadline_ts"]) <= pd.Timestamp.now(tz="UTC"):
+                continue
+            # Never rely on the exchange's per-instrument default leverage.
+            # Check before reserving quota or persisting an order intent.
+            try:
+                client.ensure_unleveraged(inst)
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                print(f"ENTRY SKIP {sym}: cannot verify 1x leverage: {exc}", flush=True)
                 continue
             if sig["asset_type"] == "stock":
                 day = str(pd.Timestamp.now(tz="UTC").date())
@@ -778,6 +804,7 @@ def main() -> None:
           f"allow_orders={allow} interval={INTERVAL}s "
           f"shared_pool_slots={MAX_POSITIONS} slot_weight={SLOT_WEIGHT:.4f} "
           f"dynamic_size={DYNAMIC_SIZE} position_mode={position_mode} "
+          f"leverage=1 margin_mode=isolated "
           f"max_data_age={MAX_DATA_AGE}s "
           f"price_source=OKX metrics_source=OKX simulated_header={int(SIMULATED_TRADING)}", flush=True)
     print("COMBINATION_POLICY " + json.dumps(POLICY.manifest(), sort_keys=True), flush=True)

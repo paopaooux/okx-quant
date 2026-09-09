@@ -144,6 +144,9 @@ class FakeClient:
     def balance(self):
         return [{"totalEq": "1000"}]
 
+    def ensure_unleveraged(self, inst):
+        pass
+
 
 @pytest.fixture
 def loop(monkeypatch):
@@ -161,7 +164,7 @@ def loop(monkeypatch):
     monkeypatch.setattr(live, "save_balance", lambda rows: None)
     monkeypatch.setattr(live, "save_strategy_snapshots", lambda rows: None)
     monkeypatch.setattr(live, "contract_specs", lambda client: {})
-    monkeypatch.setattr(live, "size_for_signal", lambda *args: "1")
+    monkeypatch.setattr(live, "size_for_signal", lambda *args, **kwargs: "1")
     monkeypatch.setattr(live, "remote_positions", lambda client: {})
     return FakeClient(), now
 
@@ -298,3 +301,84 @@ def test_uncertain_exit_does_not_block_other_positions(loop, monkeypatch):
     live.manage_positions(client, s, live.LiveData(None), now, True)
     assert "A" in s["positions"] and "B" not in s["positions"]
     assert s["entry_reconciliation_ok"] is False
+
+
+@pytest.mark.parametrize("final_lever", ["1", "3", None])
+def test_leverage_change_requires_exchange_readback(final_lever):
+    from scripts.live.okx_demo import DemoClient
+    client = object.__new__(DemoClient)
+    calls = []
+    def request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if method == "POST":
+            assert kwargs["body"] == {"instId": "TEST", "mgnMode": "isolated", "lever": "1"}
+            return [{"lever": "1"}]
+        lever = "3" if len(calls) == 1 else final_lever
+        return [] if lever is None else [{"instId": "TEST", "mgnMode": "isolated", "posSide": "net", "lever": lever}]
+    client._request = request
+    if final_lever == "1":
+        client.ensure_unleveraged("TEST")
+    else:
+        with pytest.raises(RuntimeError, match="Cannot verify"):
+            client.ensure_unleveraged("TEST")
+    assert [c[0] for c in calls] == ["GET", "POST", "GET"]
+
+
+def test_dynamic_size_rounds_up_except_final_slot():
+    from scripts.live import auto_demo as live
+    class Client: pass
+    sig = {"inst_id": "AMD-USDT-SWAP", "asset_type": "stock"}
+    spec = {"ctVal": "1", "ctValCcy": "AMD", "lotSz": "0.01", "minSz": "0.01"}
+    assert live.size_for_signal(Client(), sig, 484.0, "71.4", {sig["inst_id"]: spec}) == "0.03"
+    assert live.size_for_signal(Client(), sig, 484.0, "71.4", {sig["inst_id"]: spec}, round_up=False) == "0.02"
+
+
+def test_leverage_already_one_does_not_write():
+    from scripts.live.okx_demo import DemoClient
+    client = object.__new__(DemoClient)
+    def request(method, path, **kwargs):
+        assert method == "GET"
+        return [{"instId": "TEST", "mgnMode": "isolated", "lever": "1"}]
+    client._request = request
+    client.ensure_unleveraged("TEST")
+
+
+def test_leverage_failure_blocks_entry_without_consuming_quota(loop, monkeypatch):
+    client, now = loop
+    monkeypatch.setattr(live, "build_stock_signals", lambda _: {"TEST": signal(now=now)})
+    def fail(inst):
+        raise RuntimeError("insufficient margin")
+    client.ensure_unleveraged = fail
+    s = state()
+    live.run_once(client, s, True)
+    assert not client.orders and not s["pending_entries"] and not s["stock_entries_by_day"]
+
+
+def test_leverage_repair_failure_does_not_prevent_exits(loop, monkeypatch):
+    client, now = loop
+    expired = position("EXPIRED", now=now - pd.Timedelta(hours=4))
+    active = position("ACTIVE", now=now)
+    s = state({"EXPIRED|long": expired, "ACTIVE|long": active})
+    monkeypatch.setattr(live, "remote_positions", lambda _: {
+        k: {**p, "upl": 0.} for k, p in s["positions"].items()})
+    monkeypatch.setattr(live, "build_stock_signals", lambda _: {"NEW": signal("NEW", now=now)})
+    def fail(inst):
+        assert len(client.orders) == 1  # Expired position has already closed.
+        raise RuntimeError("network error")
+    client.ensure_unleveraged = fail
+    live.run_once(client, s, True)
+    assert len(client.orders) == 1 and client.orders[0][0] == "EXPIRED"
+    assert not s["entry_reconciliation_ok"]
+
+
+def test_observe_mode_never_sets_leverage(loop, monkeypatch):
+    client, now = loop
+    p = position(now=now)
+    s = state({"TEST-USDT-SWAP|long": p})
+    monkeypatch.setattr(live, "remote_positions", lambda _: {
+        "TEST-USDT-SWAP|long": {**p, "upl": 0.}})
+    def forbidden(inst):
+        pytest.fail("observe mode must not change leverage")
+    client.ensure_unleveraged = forbidden
+    live.run_once(client, s, False)
+    assert not client.orders
