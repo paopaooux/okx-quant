@@ -1,0 +1,24 @@
+# Merge these entries into the existing clashctl mixin; do not replace it.
+# Port 7893 must already run OKX-SG07 -> OKX-HK03 with verified API access.
+proxies:
+  append:
+    - name: okx-backup-7893
+      type: http
+      server: 127.0.0.1
+      port: 7893
+proxy-groups:
+  prepend:
+    - name: OKX-Fallback
+      type: fallback
+      proxies:
+        - Proxies
+        - okx-backup-7893
+      url: https://www.okx.com/api/v5/public/time
+      expected-status: 200
+      interval: 10
+      timeout: 5000
+      lazy: false
+      max-failed-times: 2
+rules:
+  prepend:
+    - DOMAIN-SUFFIX,okx.com,OKX-Fallback
