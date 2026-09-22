@@ -1,4 +1,4 @@
-"""Run the three long-lived data and trading processes in one container.
+"""Run the data, trading and read-only account sync processes in one container.
 
 Docker normally gives each service its own container, but the deployment target
 for this project intentionally uses one named container. This small supervisor
@@ -19,6 +19,7 @@ COMMANDS = {
     "stock-data": [sys.executable, "-m", "scripts.live.stock_data_loop"],
     "crypto-data": [sys.executable, "scripts/data/update_okx_crypto.py"],
     "demo": [sys.executable, "-m", "scripts.live.auto_demo"],
+    "account-sync": [sys.executable, "-m", "scripts.live.sync_loop"],
 }
 DATA_PROXY = os.environ.get("OKX_DATA_PROXY_URL", "").strip()
 
@@ -42,7 +43,7 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    print("okx-quant supervisor starting: stock-data, crypto-data, demo", flush=True)
+    print("okx-quant supervisor starting: " + ", ".join(COMMANDS), flush=True)
     try:
         while not stopping:
             for name, command in COMMANDS.items():

@@ -13,7 +13,9 @@ import json
 import os
 import time
 import uuid
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN
+import fcntl
+from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 
 import lightgbm as lgb
@@ -22,7 +24,11 @@ import pandas as pd
 import requests
 
 from scripts.data import build
-from scripts.live.okx_demo import BASE, SIMULATED_TRADING, DemoClient, save_balance, save_strategy_snapshots
+from scripts.live.okx_demo import BASE, SIMULATED_TRADING, DemoClient, OKXAPIError, save_balance, save_strategy_snapshots
+from scripts.live.execution_risk import (
+    TERMINAL, cleanup_protection, definitely_absent, defer_retry, protect_positions, release_entry,
+    recover_missing_exit,
+)
 from strategies.stocks.market import data as stock_data
 from strategies.stocks.market import sessions as stock_sessions
 from strategies.stocks.config import Config as StockConfig
@@ -51,7 +57,11 @@ POSITION_MODE = os.environ.get("AUTO_POSITION_MODE", "net_mode").strip().lower()
 SIZE = os.environ.get("AUTO_SIZE", "0.01")
 MAX_HOLD_BARS = int(os.environ.get("AUTO_MAX_HOLD_BARS", "48"))
 INTERVAL = max(15, int(os.environ.get("AUTO_INTERVAL", "30")))
+EXIT_INTERVAL = max(1, int(os.environ.get("AUTO_EXIT_INTERVAL", "5")))
+CAPITAL_BUFFER = max(.005, float(os.environ.get("AUTO_CAPITAL_BUFFER", "0.01")))
 MAX_DATA_AGE = int(os.environ.get("AUTO_MAX_DATA_AGE", "1800"))
+METRICS_MAX_AGE = MAX_DATA_AGE + BAR_MS // 1000  # build.py deliberately shifts metrics one bar.
+TICKER_MAX_AGE = min(30, MAX_DATA_AGE)
 STATE_PATH = Path(os.environ.get("AUTO_STATE", DATA / "auto_demo_state.json"))
 # Shared five-slot pool across stock and crypto contracts. Both directions are
 # eligible, but each instrument has one net position; this is a capacity limit,
@@ -146,6 +156,7 @@ class LiveData:
             after = oldest
         live = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close",
                                            "volume", "vol_ccy", "vol_quote", "confirm"])
+        live = live[live["confirm"].astype(str) == "1"].copy()
         for col in ("ts", "open", "high", "low", "close", "volume", "vol_quote"):
             live[col] = pd.to_numeric(live[col], errors="coerce")
         # OKX does not publish trade count/taker split. Use neutral half-volume
@@ -204,11 +215,15 @@ class LiveData:
         ratio = pd.DataFrame(ratio_pages, columns=["ts", "count_long_short_ratio"])
         for frame in (oi, ratio):
             frame["ts"] = pd.to_numeric(frame["ts"], errors="coerce")
+            if frame.empty or not fresh_bar(frame["ts"].max()):
+                raise RuntimeError(f"stale or empty OKX metrics for {sym}")
         for col in ("sum_open_interest", "sum_open_interest_value", "count_long_short_ratio"):
             if col in oi:
                 oi[col] = pd.to_numeric(oi[col], errors="coerce")
             if col in ratio:
                 ratio[col] = pd.to_numeric(ratio[col], errors="coerce")
+        oi["oi_source_ts"] = oi["ts"]
+        ratio["ratio_source_ts"] = ratio["ts"]
         m = oi[["ts", "sum_open_interest", "sum_open_interest_value"]].merge(
             ratio[["ts", "count_long_short_ratio"]], on="ts", how="outer").dropna(subset=["ts"])
         m["ts"] = (m["ts"].astype("int64") // BAR_MS) * BAR_MS
@@ -219,6 +234,10 @@ class LiveData:
         # Hold the hourly observations across the 15m bars used by build.py.
         grid = pd.DataFrame({"ts": np.arange(int(m.ts.min()), int(m.ts.max()) + BAR_MS, BAR_MS)})
         m = pd.merge_asof(grid, m.sort_values("ts"), on="ts", direction="backward")
+        for frame, source in ((oi, "oi_source_ts"), (ratio, "ratio_source_ts")):
+            sources = frame[[source]].dropna().drop_duplicates().sort_values(source)
+            sources["ts"] = (sources[source].astype("int64") // BAR_MS) * BAR_MS
+            m = pd.merge_asof(m.sort_values("ts"), sources.sort_values("ts"), on="ts", direction="backward")
         return m
 
 
@@ -234,8 +253,16 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=True, indent=2), encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=True, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
     tmp.replace(STATE_PATH)
+    directory = os.open(STATE_PATH.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _allowed_instruments() -> set[str]:
@@ -281,6 +308,8 @@ def remote_positions(client: DemoClient) -> dict[str, dict]:
             "asset_type": "crypto" if sym in SYMBOLS else "stock",
             "opened_bar": int(row.get("cTime") or 0),
             "upl": float(row.get("upl") or 0),
+            "mark_px": float(row.get("markPx") or row.get("avgPx") or 0),
+            "margin": float(row.get("margin") or 0),
         }
     return out
 
@@ -318,7 +347,7 @@ def _format_size(size: Decimal, lot: Decimal) -> str:
 
 def size_for_signal(client: DemoClient, sig: dict, mark: float,
                     total_eq: object, specs: dict[str, dict], *,
-                    round_up: bool = True) -> str | None:
+                    round_up: bool = False, budget=None) -> str | None:
     """Return an OKX-lot-aligned size for one shared-pool slot.
 
     A configured fixed size is an opt-in fallback for read-only tests. Live
@@ -331,27 +360,58 @@ def size_for_signal(client: DemoClient, sig: dict, mark: float,
     equity = _decimal(total_eq)
     price = _decimal(mark)
     if not spec or equity <= 0 or price <= 0 or SLOT_WEIGHT <= 0:
-        return fallback if use_fixed_size_fallback() else None
-    ct_val = _decimal(spec.get("ctVal"), "1")
-    ct_ccy = str(spec.get("ctValCcy") or "").upper()
-    # For BTC/altcoin swaps ctVal is denominated in the base coin; stock
-    # swaps and USD-quoted contracts use a fixed quote-currency value.
-    contract_notional = ct_val * price if ct_ccy not in {"USDT", "USD"} else ct_val
+        return None
+    contract_notional = contract_value(spec, price)
     if contract_notional <= 0:
-        return fallback
-    lot = _decimal(spec.get("lotSz"), "1")
-    minimum = _decimal(spec.get("minSz"), str(lot))
-    if lot <= 0:
-        lot = minimum if minimum > 0 else Decimal("1")
-    target = equity * _decimal(str(SLOT_WEIGHT)) / contract_notional
-    # Most entries round up so coarse contract lots do not silently turn a
-    # 20% slot into a 13% slot. The final empty slot rounds down to preserve
-    # the shared-pool equity cap after earlier lots have rounded upward.
-    rounding = ROUND_CEILING if round_up else ROUND_DOWN
-    size = (target / lot).to_integral_value(rounding=rounding) * lot
+        return None
+    lot = _decimal(spec.get("lotSz"))
+    minimum = _decimal(spec.get("minSz"))
+    if lot <= 0 or minimum <= 0:
+        return None
+    notional = equity * _decimal(str(SLOT_WEIGHT))
+    if budget is not None:
+        notional = min(notional, _decimal(budget))
+    target = notional / contract_notional
+    size = (target / lot).to_integral_value(rounding=ROUND_DOWN) * lot
     if size < minimum:
         return None
     return _format_size(size, lot)
+
+
+def contract_value(spec, mark):
+    value = _decimal(spec.get("ctVal")) * _decimal(spec.get("ctMult") or "1")
+    if str(spec.get("ctValCcy", "")).upper() not in {"USD", "USDT"}:
+        value *= _decimal(mark)
+    return value
+
+
+def entry_budget(balance, state, specs, tickers):
+    usdt = next((d for d in (balance[0].get("details", []) if balance else [])
+                 if d.get("ccy") == "USDT"), {})
+    available = [_decimal(usdt[k]) for k in ("availEq", "availBal") if usdt.get(k) not in (None, "")]
+    equity = _decimal(usdt.get("cashBal"))
+    if not available or equity <= 0:
+        return Decimal(0), Decimal(0)
+    used = Decimal(0)
+    for p in list(state["positions"].values()) + list(state.get("pending_entries", {}).values()):
+        spec = specs.get(p["inst_id"])
+        if not spec:
+            return equity, Decimal(0)
+        mark = tickers.get(p.get("symbol"), (p.get("mark_px") or p["entry_px"], 0))[0]
+        value = max(contract_value(spec, mark), contract_value(spec, p["entry_px"]))
+        if value <= 0:
+            return equity, Decimal(0)
+        used += max(value * _decimal(p["size"]), _decimal(p.get("margin")))
+    reserve = equity * _decimal(CAPITAL_BUFFER)
+    return equity, max(Decimal(0), min(equity - used, min(available)) - reserve)
+
+
+def fresh_bar(stamp, *, max_age=None):
+    try:
+        age = time.time() - float(stamp) / 1000
+        return -5 <= age <= (MAX_DATA_AGE if max_age is None else max_age)
+    except (TypeError, ValueError):
+        return False
 
 
 def use_fixed_size_fallback() -> bool:
@@ -378,18 +438,18 @@ def validate_position_mode(client: DemoClient) -> str:
 def build_crypto_signals(data: LiveData) -> dict[str, dict]:
     raw_k, raw_m, frames = {}, {}, {}
     for sym in SYMBOLS:
-        raw_k[sym], raw_m[sym] = data.klines(sym), data.metrics(sym)
-    newest = max(int(k.ts.max()) for k in raw_k.values())
-    age = time.time() - newest / 1000.0
-    if age > MAX_DATA_AGE:
-        raise RuntimeError(f"stale OKX kline data: newest={newest} age={age:.0f}s")
-    newest_metrics = max(int(m.ts.max()) for m in raw_m.values() if not m.empty)
-    metrics_age = time.time() - newest_metrics / 1000.0
-    if metrics_age > MAX_DATA_AGE:
-        raise RuntimeError(f"stale OKX metrics data: newest={newest_metrics} age={metrics_age:.0f}s")
+        try:
+            k, m = data.klines(sym), data.metrics(sym)
+            if k.empty or m.empty or not fresh_bar(k.ts.max()) or not fresh_bar(m.ts.max()):
+                raise RuntimeError("stale per-symbol input")
+            raw_k[sym], raw_m[sym] = k, m
+        except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+            print(f"CRYPTO DATA SKIP {sym}: {type(exc).__name__}", flush=True)
+    if "BTCUSDT" not in raw_k:
+        return {}  # Altcoin relative-return features depend on fresh BTC bars.
     btc_close = raw_k["BTCUSDT"].set_index("ts")["close"].astype(float)
     btc_ret = pd.Series(np.log(btc_close).diff(16).to_numpy(), index=btc_close.index)
-    for sym in SYMBOLS:
+    for sym in raw_k:
         frames[sym] = build.build_symbol(sym, btc_ret if sym != "BTCUSDT" else None,
                                          klines_df=raw_k[sym], metrics_df=raw_m[sym])
 
@@ -401,7 +461,7 @@ def build_crypto_signals(data: LiveData) -> dict[str, dict]:
     lo = float(last_fold[f"lo_{TAIL}"].iloc[-1])
     signals = {}
     cutoff = int(time.time() * 1000) // BAR_MS * BAR_MS
-    for sym in SYMBOLS:
+    for sym in frames:
         f = frames[sym]
         # LightGBM can route missing values. Requiring every feature to be
         # non-null would discard all OKX bars because OKX has no top-trader and
@@ -410,6 +470,17 @@ def build_crypto_signals(data: LiveData) -> dict[str, dict]:
         if rows.empty:
             continue
         row = rows.iloc[-1]
+        if not fresh_bar(row["ts"]):
+            continue
+        aligned = raw_m[sym][raw_m[sym].ts < row["ts"]]
+        if aligned.empty or not fresh_bar(aligned.ts.max(), max_age=METRICS_MAX_AGE):
+            continue
+        source_ts = [aligned.ts.max()]
+        source_ts.extend(aligned.iloc[-1][c] for c in ("oi_source_ts", "ratio_source_ts") if c in aligned)
+        if not all(fresh_bar(t, max_age=METRICS_MAX_AGE) for t in source_ts):
+            continue
+        if not fresh_bar(raw_k["BTCUSDT"].ts.max()):
+            continue
         x = row[[name for name in feats if name != "sym_code"]].to_frame().T.copy()
         x["sym_code"] = SYMBOL_CODE[sym]
         x = x[feats]
@@ -422,11 +493,7 @@ def build_crypto_signals(data: LiveData) -> dict[str, dict]:
                         "strategy": "okx_quant_c", "asset_type": "crypto",
                         "inst_id": sym.replace("USDT", "-USDT-SWAP"),
                         "missing_features": x.columns[x.isna().iloc[0]].tolist()}
-    if signals:
-        newest_signal = max(x["bar"] for x in signals.values())
-        signal_age = time.time() - newest_signal / 1000.0
-        if signal_age > MAX_DATA_AGE:
-            raise RuntimeError(f"stale aligned feature data: newest={newest_signal} age={signal_age:.0f}s")
+        signals[sym]["metrics_ts"] = int(min(source_ts))
     return signals
 
 
@@ -511,9 +578,17 @@ def reconcile_pending_entries(client, state):
     for client_id, pending in list(state.setdefault("pending_entries", {}).items()):
         try:
             detail = client.order_detail(pending["inst_id"], pending.get("ord_id"), client_order_id=client_id)
-        except (requests.RequestException, RuntimeError, ValueError):
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
             # An uncertain submission reserves its slot. Never retry it under
             # a new ID, and do not let an entry lookup disable other exits.
+            try:
+                absent = definitely_absent(client, pending, client_id, exc)
+            except (requests.RequestException, RuntimeError, ValueError):
+                absent = False
+            if absent:
+                release_entry(state, client_id, retry=True, error=exc)
+                save_state(state)
+                continue
             state["entry_reconciliation_ok"] = False
             print(f"ENTRY RECONCILIATION UNKNOWN {pending['inst_id']} client_id={client_id}", flush=True)
             continue
@@ -521,13 +596,22 @@ def reconcile_pending_entries(client, state):
         if filled > 0:
             key = position_key(pending["inst_id"], pending["side"])
             exiting = {k: v for k, v in state["positions"].get(key, {}).items()
-                       if k in {"exit_ord_id", "exit_client_id"}}
+                       if k.startswith(("exit_", "stop_")) or k == "force_exit"}
             state["positions"][key] = {**pending, "size": str(filled),
                                         "entry_px": float(detail.get("avgPx") or pending["entry_px"]), **exiting}
         if detail.get("state") in {"filled", "canceled", "mmp_canceled"}:
-            state["pending_entries"].pop(client_id)
             if filled > 0:
+                state["pending_entries"].pop(client_id)
                 state["trades"] = int(state.get("trades", 0)) + 1
+            else:
+                release_entry(state, client_id, retry=True)
+        elif detail.get("ordId"):
+            # A partially filled market entry must not keep adding exposure
+            # after its filled portion has been closed by risk management.
+            try:
+                client.cancel_order(pending["inst_id"], detail["ordId"])
+            except (requests.RequestException, RuntimeError, ValueError):
+                state["entry_reconciliation_ok"] = False
         save_state(state)
 
 
@@ -541,7 +625,14 @@ def manage_positions(client, state, data, now, allow_orders):
                 continue
             try:
                 detail = client.order_detail(inst, pos.get("exit_ord_id"), client_order_id=pos.get("exit_client_id"))
-            except (requests.RequestException, RuntimeError, ValueError):
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                try:
+                    recovered = recover_missing_exit(client, pos, exc)
+                except (requests.RequestException, RuntimeError, ValueError):
+                    recovered = False
+                save_state(state)
+                if recovered:
+                    continue
                 state["entry_reconciliation_ok"] = False
                 print(f"EXIT RECONCILIATION UNKNOWN {sym}", flush=True)
                 continue
@@ -553,27 +644,37 @@ def manage_positions(client, state, data, now, allow_orders):
                 pos.pop("exit_client_id", None)
             save_state(state)
             continue
-        try:
-            mark, stamp = data.ticker(sym, pos["asset_type"])
-            if not -5 <= time.time() - stamp / 1000 <= MAX_DATA_AGE:
-                raise RuntimeError("stale execution ticker")
-        except (requests.RequestException, RuntimeError, ValueError) as exc:
-            print(f"EXIT PRICE UNAVAILABLE {sym}: {type(exc).__name__}", flush=True)
-            continue
-        tickers[sym] = (mark, stamp)
-        reason = exit_reason(pos, mark, now)
-        if not reason or not allow_orders:
+        reason = pos.get("force_exit") or exit_reason(pos, float("nan"), pd.Timestamp.now(tz="UTC"))
+        if not reason:
+            try:
+                mark, stamp = data.ticker(sym, pos["asset_type"])
+                if not fresh_bar(stamp, max_age=TICKER_MAX_AGE):
+                    raise RuntimeError("stale execution ticker")
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                print(f"EXIT PRICE UNAVAILABLE {sym}: {type(exc).__name__}", flush=True)
+                continue
+            tickers[sym] = (mark, stamp)
+            reason = exit_reason(pos, mark, pd.Timestamp.now(tz="UTC"))
+        if not reason or not allow_orders or time.time() < pos.get("exit_retry_after", 0):
             continue
         client_id = uuid.uuid4().hex
         pos["exit_client_id"] = client_id
+        pos["exit_exp_time"] = int(time.time() * 1000) + 10_000
         save_state(state)
         try:
             result = client.order(inst, "sell" if pos["side"] == "long" else "buy", pos["size"],
-                                  "isolated", True, pos_side=order_pos_side(pos["side"]), client_order_id=client_id)
+                                  "isolated", True, pos_side=order_pos_side(pos["side"]), client_order_id=client_id,
+                                  exp_time=pos["exit_exp_time"])
             pos["exit_ord_id"] = result[0].get("ordId") if result else None
             save_state(state)
             detail = client.order_detail(inst, pos.get("exit_ord_id"), client_order_id=client_id)
-        except (requests.RequestException, RuntimeError, ValueError):
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            if isinstance(exc, OKXAPIError) and exc.rejected and not pos.get("exit_ord_id"):
+                pos.pop("exit_client_id", None)
+                defer_retry(pos, "exit_retry", exc)
+                save_state(state)
+                print(f"EXIT REJECTED {sym}: {exc}", flush=True)
+                continue
             state["entry_reconciliation_ok"] = False
             print(f"EXIT SUBMISSION UNKNOWN {sym} client_id={client_id}", flush=True)
             continue
@@ -588,7 +689,8 @@ def manage_positions(client, state, data, now, allow_orders):
     return tickers
 
 
-def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
+def run_once(client: DemoClient, state: dict, allow_orders: bool, *, prepared_signals=None,
+             management_only=False) -> dict:
     state = _migrate_state(state)
     data = LiveData(client.s)
     now = pd.Timestamp.now(tz="UTC")
@@ -597,14 +699,31 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
     # left the current candle window.
     if allow_orders:
         reconcile_pending_entries(client, state)
-    remote = remote_positions(client)
+    try:
+        remote = remote_positions(client)
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        state["entry_reconciliation_ok"] = False
+        print(f"POSITION SYNC FAILED: {type(exc).__name__}; managing known positions", flush=True)
+        migrate_policy_state(state, now)
+        manage_positions(client, state, data, now, allow_orders)
+        if allow_orders:
+            if state["positions"]:
+                try:
+                    protect_positions(client, state, contract_specs(client), save_state)
+                except (requests.RequestException, RuntimeError, ValueError) as protection_error:
+                    print(f"PROTECTION UNAVAILABLE: {type(protection_error).__name__}", flush=True)
+                if any(p.get("force_exit") for p in state["positions"].values()):
+                    manage_positions(client, state, data, pd.Timestamp.now(tz="UTC"), True)
+            save_state(state)
+        return state
     pending_instruments = {p["inst_id"] for p in state.get("pending_entries", {}).values()}
     for key in list(state["positions"]):
         if key not in remote and state["positions"][key]["inst_id"] not in pending_instruments:
             state["positions"].pop(key, None)
     for key, pos in remote.items():
         if key in state["positions"]:
-            state["positions"][key].update(size=pos["size"], upl=pos["upl"])
+            state["positions"][key].update(size=pos["size"], upl=pos["upl"],
+                                            mark_px=pos.get("mark_px"), margin=pos.get("margin"))
         else:
             pending = next((p for p in state.get("pending_entries", {}).values()
                             if p["inst_id"] == pos["inst_id"] and p["side"] == pos["side"]), {})
@@ -614,6 +733,18 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
     if allow_orders:
         save_state(state)
     managed_tickers = manage_positions(client, state, data, now, allow_orders)
+    if allow_orders:
+        cleanup_protection(client, state, save_state)
+        if state["positions"]:
+            try:
+                protect_positions(client, state, contract_specs(client), save_state)
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                state["entry_reconciliation_ok"] = False
+                print(f"PROTECTION METADATA UNAVAILABLE: {type(exc).__name__}", flush=True)
+            if any(p.get("force_exit") for p in state["positions"].values()):
+                manage_positions(client, state, data, pd.Timestamp.now(tz="UTC"), allow_orders)
+    if management_only:
+        return state
     # Exits always run first. An unsuccessful leverage repair blocks entries,
     # while the next cycle can still close positions normally.
     if allow_orders:
@@ -623,12 +754,7 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
             except (requests.RequestException, RuntimeError, ValueError) as exc:
                 state["entry_reconciliation_ok"] = False
                 print(f"LEVERAGE CHECK FAILED {inst}: {exc}", flush=True)
-    signals = {}
-    try:
-        signals.update(build_crypto_signals(data))
-    except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
-        print(f"CRYPTO ENTRIES UNAVAILABLE: {type(exc).__name__}", flush=True)
-    signals.update(build_stock_signals(pd.Timestamp.now(tz="UTC")))
+    signals = dict(prepared_signals) if prepared_signals is not None else collect_signals(data)
     # Continue managing a live position after its original stock event leaves
     # the current candle window.
     for key, pos in state.get("positions", {}).items():
@@ -653,20 +779,23 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
         if pos.get("symbol") not in ticker_symbols and pos.get("inst_id") not in ticker_symbols
     )
     ticker_symbols = list(dict.fromkeys(s for s in ticker_symbols if s))
-    tickers = {sym: managed_tickers[sym] if sym in managed_tickers else
-               data.ticker(sym, signals.get(sym, {}).get("asset_type", "crypto")) for sym in ticker_symbols}
-    now_ms = int(time.time() * 1000)
-    for sym, (_, ts) in tickers.items():
-        if now_ms - ts > MAX_DATA_AGE * 1000:
-            raise RuntimeError(f"stale OKX ticker data for {sym}: age={(now_ms - ts) / 1000:.0f}s")
+    tickers = {}
+    for sym in ticker_symbols:
+        try:
+            tick = data.ticker(sym, signals.get(sym, {}).get("asset_type", "crypto"))
+            if not fresh_bar(tick[1], max_age=TICKER_MAX_AGE):
+                raise RuntimeError("stale ticker")
+            tickers[sym] = tick
+        except (requests.RequestException, RuntimeError, ValueError):
+            print(f"ENTRY PRICE SKIP {sym}", flush=True)
+    ticker_symbols = list(tickers)
     specs = contract_specs(client) if allow_orders else {}
     last_bars = state.setdefault("last_bars", {})
     balance = client.balance()
     save_balance(balance)
     total_eq = balance[0].get("totalEq") if balance else None
-    # Match the backtest's realized-equity sizing instead of compounding open
-    # PNL into subsequent entries. Actual fees/funding remain account costs.
-    sizing_eq = float(total_eq or 0.) - sum(float(p.get("upl") or 0.) for p in state["positions"].values())
+    # Only settled USDT funds finance isolated USDT swaps.
+    sizing_eq, remaining_budget = entry_budget(balance, state, specs, tickers)
     cycle_id = uuid.uuid4().hex
     ordered_signals = sorted(
         signals.items(),
@@ -676,6 +805,17 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
     for sym, sig in ordered_signals:
         inst = sig.get("inst_id") or sym.replace("USDT", "-USDT-SWAP")
         bar_key = position_key(inst, sig["side"]) if sig["side"] in {"long", "short"} else sym
+        max_age = STOCK_DATA_MAX_AGE if sig.get("asset_type") == "stock" else MAX_DATA_AGE
+        if sym not in tickers or not fresh_bar(sig["bar"], max_age=max_age):
+            continue
+        if sig.get("metrics_ts") and not fresh_bar(sig["metrics_ts"], max_age=METRICS_MAX_AGE):
+            continue
+        if any(p["inst_id"] == inst for p in state.get("protective_orders", {}).values()
+               if p.get("position_key") not in state["positions"]):
+            continue
+        retry = state.setdefault("entry_retries", {}).get(bar_key, {})
+        if time.time() < retry.get("retry_after", 0):
+            continue
         if sig.get("management_only") or sig["side"] == "flat" or sig["bar"] <= int(last_bars.get(bar_key, 0)):
             continue
         last_bars[bar_key] = sig["bar"]
@@ -696,11 +836,10 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
         active_count = len(state["positions"]) + len(state.get("pending_entries", {}))
         if allow_orders and active_count < MAX_POSITIONS:
             side = "buy" if sig["side"] == "long" else "sell"
-            # Round up for ordinary slots; use the remaining slot as the
-            # conservative cap so aggregate lots cannot exceed one account.
-            final_empty_slot = active_count == MAX_POSITIONS - 1
+            _, fresh_budget = entry_budget(client.balance(), state, specs, tickers)
+            remaining_budget = min(remaining_budget, fresh_budget)
             size = size_for_signal(client, sig, tickers[sym][0], sizing_eq, specs,
-                                   round_up=not final_empty_slot)
+                                   budget=remaining_budget)
             if not size:
                 print(f"ENTRY SKIP {sym}: no valid contract size for equity={total_eq}", flush=True)
                 continue
@@ -717,18 +856,45 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
             # Never rely on the exchange's per-instrument default leverage.
             # Check before reserving quota or persisting an order intent.
             try:
+                if client.pending_orders(inst):
+                    print(f"ENTRY SKIP {sym}: exchange orders still pending", flush=True)
+                    continue
                 client.ensure_unleveraged(inst)
             except (requests.RequestException, RuntimeError, ValueError) as exc:
                 print(f"ENTRY SKIP {sym}: cannot verify 1x leverage: {exc}", flush=True)
                 continue
+            if not fresh_bar(sig["bar"], max_age=max_age) or pd.Timestamp(pending["deadline_ts"]) <= pd.Timestamp.now(tz="UTC"):
+                continue
+            # Account checks can take seconds. Requote and cap the final size
+            # immediately before persisting the order intent.
+            quote = data.ticker(sym, sig["asset_type"])
+            if not fresh_bar(quote[1], max_age=TICKER_MAX_AGE):
+                continue
+            tickers[sym] = quote
+            size = size_for_signal(client, sig, quote[0], sizing_eq, specs, budget=remaining_budget)
+            if not size:
+                continue
+            pending.update(size=size, entry_px=quote[0])
+            pending["exp_time"] = int(time.time() * 1000) + 10_000
             if sig["asset_type"] == "stock":
                 day = str(pd.Timestamp.now(tz="UTC").date())
                 ledger = state.setdefault("stock_entries_by_day", {})
                 ledger[day] = ledger.get(day, 0) + 1
+                pending["quota_day"] = day
             state["pending_entries"][client_id] = pending
             save_state(state)
-            result = client.order(inst, side, size, td_mode, False, quick_mgn_type,
-                                  pos_side=order_pos_side(sig["side"]), client_order_id=client_id)
+            try:
+                result = client.order(inst, side, size, td_mode, False, quick_mgn_type,
+                                      pos_side=order_pos_side(sig["side"]), client_order_id=client_id,
+                                      exp_time=pending["exp_time"])
+            except OKXAPIError as exc:
+                if exc.rejected:
+                    release_entry(state, client_id, retry=True, error=exc)
+                    save_state(state)
+                    print(f"ENTRY REJECTED {sym}: {exc}", flush=True)
+                    continue
+                raise
+            remaining_budget = max(Decimal(0), remaining_budget - _decimal(size) * contract_value(specs[inst], tickers[sym][0]))
             ord_id = result[0].get("ordId") if result else ""
             pending["ord_id"] = ord_id
             save_state(state)
@@ -739,16 +905,22 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
                     "entry_px": float(detail.get("avgPx") or tickers[sym][0])}
                 state["pending_entries"].pop(client_id, None)
                 state["trades"] = int(state.get("trades", 0)) + 1
+                state["entry_retries"].pop(bar_key, None)
+                protect_positions(client, state, specs, save_state)
+                if state["positions"][entry_key].get("force_exit"):
+                    manage_positions(client, state, data, pd.Timestamp.now(tz="UTC"), allow_orders)
                 p_text = f"{sig['p_up']:.5f}" if sig.get("p_up") is not None else "n/a"
                 print(f"ENTRY {sym} strategy={sig.get('strategy')} side={sig['side']} p={p_text} ord={ord_id}", flush=True)
             elif detail.get("state") in {"canceled", "mmp_canceled"} and not float(detail.get("accFillSz") or 0):
-                state["pending_entries"].pop(client_id, None)
+                release_entry(state, client_id, retry=True)
             save_state(state)
     for sym, sig in signals.items():
         if sig.get("management_only"):
             continue
         inst = sig.get("inst_id") or sym.replace("USDT", "-USDT-SWAP")
         key = position_key(inst, sig["side"]) if sig.get("side") in {"long", "short"} else sym
+        if key in state.get("entry_retries", {}):
+            continue
         last_bars[key] = max(int(last_bars.get(key, 0)), int(sig.get("bar") or 0))
     state["last_bar"] = max(last_bars.values(), default=int(state.get("last_bar", 0)))
     # Store a row for every symbol on every cycle, including flat symbols. This
@@ -782,12 +954,47 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool) -> dict:
                 "raw_json": json.dumps({"signal": sig, "position": pos}, ensure_ascii=True),
             })
     save_strategy_snapshots(snapshot_rows)
-    save_state(state)
+    if allow_orders:
+        save_state(state)
     print("signals:", json.dumps(signals, ensure_ascii=True),
           "okx_tickers:", json.dumps({s: {"last": p, "ts": ts} for s, (p, ts) in tickers.items()},
                                       ensure_ascii=True),
           "positions:", len(state["positions"]), flush=True)
     return state
+
+
+def collect_signals(data):
+    signals = {}
+    try:
+        signals.update(build_crypto_signals(data))
+    except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+        print(f"CRYPTO ENTRIES UNAVAILABLE: {type(exc).__name__}", flush=True)
+    signals.update(build_stock_signals(pd.Timestamp.now(tz="UTC")))
+    return signals
+
+
+class SignalWorker:
+    """Signal computation owns its session and never reads or writes live state."""
+    def __init__(self, data):
+        self.data = data
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="signals")
+        self.future = None
+        self.next_run = 0.
+
+    def poll(self):
+        result = None
+        if self.future is not None and self.future.done():
+            try:
+                result = self.future.result()
+            finally:
+                self.future = None
+                self.next_run = time.monotonic() + INTERVAL
+        if self.future is None and time.monotonic() >= self.next_run:
+            self.future = self.pool.submit(collect_signals, self.data)
+        return result
+
+    def close(self):
+        self.pool.shutdown(wait=True, cancel_futures=True)
 
 
 def main() -> None:
@@ -800,6 +1007,15 @@ def main() -> None:
     position_mode = validate_position_mode(client)
     state = load_state()
     allow = os.environ.get("AUTO_TRADE", "false").lower() in {"1", "true", "yes", "on"} and not args.observe
+    lock = None
+    if allow:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        lock = STATE_PATH.with_suffix(".lock").open("a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("another execution process owns this live state")
+        state = load_state()
     print(f"auto demo model={MODEL_TAG} universe={len(SYMBOLS)} tail={TAIL} "
           f"allow_orders={allow} interval={INTERVAL}s "
           f"shared_pool_slots={MAX_POSITIONS} slot_weight={SLOT_WEIGHT:.4f} "
@@ -808,14 +1024,26 @@ def main() -> None:
           f"max_data_age={MAX_DATA_AGE}s "
           f"price_source=OKX metrics_source=OKX simulated_header={int(SIMULATED_TRADING)}", flush=True)
     print("COMBINATION_POLICY " + json.dumps(POLICY.manifest(), sort_keys=True), flush=True)
-    while True:
-        try:
-            run_once(client, state, allow)
-        except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
-            print(f"auto cycle failed: {exc}", flush=True)
-        if args.once:
-            return
-        time.sleep(INTERVAL)
+    if args.once:
+        run_once(client, state, allow)
+        return
+    signal_client = DemoClient()
+    worker = SignalWorker(LiveData(signal_client.s))
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                signals = worker.poll()
+                run_once(client, state, allow, prepared_signals=signals or {},
+                         management_only=signals is None)
+            except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+                print(f"auto cycle failed: {exc}", flush=True)
+            time.sleep(max(.1, EXIT_INTERVAL - (time.monotonic() - started)))
+    finally:
+        worker.close()
+        signal_client.s.close()
+        if lock:
+            lock.close()
 
 
 def validate_combination_config():

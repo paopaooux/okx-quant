@@ -38,9 +38,23 @@ SIMULATED_TRADING = os.environ.get("OKX_SIMULATED_TRADING", "1").strip().lower()
 }
 
 
+class OKXAPIError(RuntimeError):
+    """Preserve exchange error codes without treating a timeout as rejection."""
+    def __init__(self, code, message="", *, status=200, data=None):
+        self.code, self.status, self.data = str(code), status, data
+        super().__init__(f"OKX {self.code} (HTTP {status}): {message}")
+
+    @property
+    def rejected(self):
+        # Unknown/internal errors and duplicate IDs require reconciliation.
+        business_rejection = self.code.startswith(("510", "511", "512", "513")) and self.code not in {"51016", "51149"}
+        return self.status < 500 and (business_rejection or self.code.startswith("501")
+                                     or self.code in {"50011", "50014", "50061"})
+
+
 def db_connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(DB_PATH)
+    db = sqlite3.connect(DB_PATH, timeout=30)
     db.row_factory = sqlite3.Row
     db.executescript("""
     CREATE TABLE IF NOT EXISTS balance_snapshots (
@@ -74,6 +88,9 @@ def db_connect():
       position_side TEXT, position_size TEXT, entry_px REAL, width REAL,
       stop_px REAL, take_px REAL, total_eq TEXT, raw_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS account_sync_state (
+      stream TEXT PRIMARY KEY, raw_json TEXT NOT NULL
+    );
     """)
     # Keep databases created by earlier versions usable.
     columns = {row[1] for row in db.execute("PRAGMA table_info(balance_snapshots)")}
@@ -83,6 +100,8 @@ def db_connect():
     for name, ddl in (("strategy", "TEXT"), ("asset_type", "TEXT")):
         if name not in snapshot_columns:
             db.execute(f"ALTER TABLE strategy_snapshots ADD COLUMN {name} {ddl}")
+    # Trade IDs are instrument-scoped, unlike bill IDs.
+    db.execute("UPDATE fills SET trade_id=inst_id || ':' || trade_id WHERE instr(trade_id, ':')=0")
     return db
 
 
@@ -93,7 +112,14 @@ def save_balance(rows):
                    (datetime.now(timezone.utc).isoformat(), total_eq, json.dumps(rows, ensure_ascii=True)))
 
 
-def save_account_data(positions, fills, bills):
+def exchange_ts(value, fallback):
+    try:
+        return datetime.fromtimestamp(int(value) / 1000, timezone.utc).isoformat()
+    except (ValueError, TypeError, OverflowError):
+        return fallback
+
+
+def save_account_data(positions, fills, bills, *, sync_state=None):
     now = datetime.now(timezone.utc).isoformat()
     with db_connect() as db:
         for p in positions:
@@ -103,11 +129,13 @@ def save_account_data(positions, fills, bills):
               p.get("avgPx"), p.get("markPx"), p.get("upl"), p.get("uplRatio"), p.get("liqPx"),
               p.get("margin"), p.get("lever"), json.dumps(p, ensure_ascii=True)))
         for f in fills:
-            tid = f.get("tradeId") or f.get("fillId")
+            tid = f.get("tradeId") or f.get("fillId") or f.get("billId")
             if tid:
+                tid = f"{f.get('instId')}:{tid}"
                 db.execute("""INSERT OR IGNORE INTO fills
                   (trade_id,ts,inst_id,ord_id,side,fill_px,fill_sz,fee,fee_ccy,exec_type,raw_json)
-                  VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (tid, now, f.get("instId"), f.get("ordId"), f.get("side"),
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                  ON CONFLICT(trade_id) DO UPDATE SET ts=excluded.ts, raw_json=excluded.raw_json""", (tid, exchange_ts(f.get("fillTime") or f.get("ts"), now), f.get("instId"), f.get("ordId"), f.get("side"),
                   f.get("fillPx"), f.get("fillSz"), f.get("fee"), f.get("feeCcy"), f.get("execType"),
                   json.dumps(f, ensure_ascii=True)))
         for b in bills:
@@ -115,8 +143,13 @@ def save_account_data(positions, fills, bills):
             if bid:
                 db.execute("""INSERT OR IGNORE INTO bills
                   (bill_id,ts,bill_type,sub_type,inst_id,currency,amount,balance,raw_json)
-                  VALUES (?,?,?,?,?,?,?,?,?)""", (bid, now, b.get("type"), b.get("subType"), b.get("instId"),
+                  VALUES (?,?,?,?,?,?,?,?,?)
+                  ON CONFLICT(bill_id) DO UPDATE SET ts=excluded.ts, raw_json=excluded.raw_json""", (bid, exchange_ts(b.get("ts"), now), b.get("type"), b.get("subType"), b.get("instId"),
                   b.get("ccy"), b.get("balChg"), b.get("bal"), json.dumps(b, ensure_ascii=True)))
+        if sync_state is not None:
+            stream, checkpoint = sync_state
+            db.execute("INSERT OR REPLACE INTO account_sync_state VALUES (?,?)",
+                       (stream, json.dumps(checkpoint)))
 
 
 def save_strategy_snapshots(rows):
@@ -134,36 +167,34 @@ def save_strategy_snapshots(rows):
 
 def print_stats():
     with db_connect() as db:
-        row = db.execute("""SELECT COUNT(*) orders,
-            COALESCE(SUM(CAST(pnl AS REAL)), 0) pnl,
-            COALESCE(SUM(ABS(CAST(fee AS REAL))), 0) fees,
-            COALESCE(SUM(CAST(fill_sz AS REAL)), 0) volume
-            FROM orders WHERE state IN ('filled','partially_filled')""").fetchone()
-        fill_row = db.execute("""SELECT COUNT(*) count,
-            COALESCE(SUM(CAST(fill_sz AS REAL)),0) volume,
-            COALESCE(SUM(ABS(CAST(fee AS REAL))),0) fees FROM fills""").fetchone()
-        bill_row = db.execute("""SELECT COALESCE(SUM(CASE WHEN sub_type IN ('173','funding_fee') THEN CAST(amount AS REAL) ELSE 0 END),0) funding,
-            COALESCE(SUM(CASE WHEN sub_type IN ('5','fee') THEN CAST(amount AS REAL) ELSE 0 END),0) fees FROM bills""").fetchone()
-        equity = db.execute("SELECT total_eq FROM balance_snapshots WHERE total_eq IS NOT NULL ORDER BY id").fetchall()
-        positions = db.execute("""SELECT inst_id,
-            SUM(CASE WHEN side='buy' THEN CAST(fill_sz AS REAL) ELSE -CAST(fill_sz AS REAL) END) net_sz
-            FROM orders WHERE state IN ('filled','partially_filled') GROUP BY inst_id
-            HAVING ABS(net_sz) > 1e-12 ORDER BY inst_id""").fetchall()
+        fills = db.execute("SELECT * FROM fills").fetchall()
+        bills = db.execute("SELECT * FROM bills").fetchall()
+        totals = {}
+        for f in fills:
+            raw = json.loads(f["raw_json"])
+            currency = f["fee_ccy"] or "unknown"
+            total = totals.setdefault(currency, {"pnl": 0., "fees": 0., "funding": 0.})
+            total["pnl"] += float(raw.get("fillPnl") or 0)
+            total["fees"] += float(f["fee"] or 0)
+        for b in bills:
+            if b["bill_type"] == "8" or b["sub_type"] in {"173", "174", "funding_fee"}:
+                total = totals.setdefault(b["currency"] or "unknown", {"pnl": 0., "fees": 0., "funding": 0.})
+                total["funding"] += float(b["amount"] or 0)
         snap = db.execute("""SELECT COUNT(*) count, MIN(ts) first_ts, MAX(ts) last_ts,
             COUNT(DISTINCT cycle_id) cycles FROM strategy_snapshots""").fetchone()
         print(f"database: {DB_PATH}")
-        print(f"orders: {row['orders']}  filled volume: {row['volume']:.8g}")
-        print(f"realized pnl: {row['pnl']:.8f} USDT  fees: {row['fees']:.8f} USDT")
-        print(f"fills: {fill_row['count']}  fill volume: {fill_row['volume']:.8g}  funding: {bill_row['funding']:.8f}  bill fees: {bill_row['fees']:.8f}")
+        print(f"recorded account fills: {len(fills)}  bills: {len(bills)}")
+        for currency, total in sorted(totals.items()):
+            net = sum(total.values())
+            print(f"{currency}: realized_pnl={total['pnl']:.8f} fee_cashflow={total['fees']:.8f} "
+                  f"funding_cashflow={total['funding']:.8f} total={net:.8f}")
+        for row in db.execute("SELECT stream,raw_json FROM account_sync_state"):
+            checkpoint = json.loads(row["raw_json"])
+            print(f"sync {row['stream']}: backfill_active={checkpoint.get('active')} "
+                  f"watermark_ms={checkpoint.get('watermark', 0)}")
+        print("Totals cover recorded account swaps; deposits, withdrawals and other bill types are excluded.")
         print(f"strategy snapshots: {snap['count']} rows / {snap['cycles']} cycles  "
               f"({snap['first_ts'] or 'n/a'} -> {snap['last_ts'] or 'n/a'})")
-        if len(equity) >= 2:
-            initial, latest = float(equity[0][0]), float(equity[-1][0])
-            roi = (latest / initial - 1.0) * 100 if initial else 0.0
-            print(f"equity: {latest:.8f} USDT  return: {roi:.6f}% (since first snapshot)")
-        print("net positions:")
-        for p in positions:
-            print(f"  {p['inst_id']}: {p['net_sz']:.8g} contracts")
 
 class DemoClient:
     def __init__(self):
@@ -185,9 +216,10 @@ class DemoClient:
         })
         proxy = os.environ.get("OKX_PROXY_URL")
         if proxy:
+            self.s.trust_env = False
             self.s.proxies.update({"http": proxy, "https": proxy})
 
-    def _request(self, method, path, body=None, params=None):
+    def _request(self, method, path, body=None, params=None, exp_time=None):
         body_text = json.dumps(body, separators=(",", ":")) if body else ""
         query = urlencode(params or {}, doseq=True)
         request_path = path + ("?" + query if query else "")
@@ -198,6 +230,8 @@ class DemoClient:
                    "OK-ACCESS-TIMESTAMP": ts, "OK-ACCESS-PASSPHRASE": self.passphrase}
         if SIMULATED_TRADING:
             headers["x-simulated-trading"] = "1"
+        if exp_time is not None:
+            headers["expTime"] = str(exp_time)
         # Pass the already-encoded query in the URL so it is byte-for-byte the
         # same path that was signed above.
         r = self.s.request(method, BASE + request_path, data=body_text, headers=headers, timeout=15)
@@ -207,10 +241,14 @@ class DemoClient:
             r.raise_for_status()
             raise RuntimeError(f"OKX returned non-JSON HTTP {r.status_code}")
         if r.status_code >= 400 or p.get("code") != "0":
-            raise RuntimeError({"http_status": r.status_code,
-                                "okx_code": p.get("code"),
-                                "okx_msg": p.get("msg"),
-                                "data": p.get("data")})
+            failed = next((x for x in (p.get("data") or []) if isinstance(x, dict)
+                           and x.get("sCode") not in (None, "", "0")), {})
+            raise OKXAPIError(failed.get("sCode") or p.get("code"),
+                              failed.get("sMsg") or p.get("msg"),
+                              status=r.status_code, data=p.get("data"))
+        for row in (p.get("data") or []):
+            if isinstance(row, dict) and row.get("sCode") not in (None, "", "0"):
+                raise OKXAPIError(row["sCode"], row.get("sMsg"), status=r.status_code, data=p["data"])
         return p.get("data", [])
 
     def balance(self):
@@ -265,6 +303,35 @@ class DemoClient:
     def bills(self):
         return self._request("GET", "/api/v5/account/bills", params={"instType": "SWAP", "limit": "100"})
 
+    def history_page(self, stream, **params):
+        paths = {"fills": "/api/v5/trade/fills-history", "bills": "/api/v5/account/bills-archive"}
+        return self._request("GET", paths[stream], params={"instType": "SWAP", "limit": "100", **params})
+
+    def pending_orders(self, inst_id):
+        return self._request("GET", "/api/v5/trade/orders-pending", params={"instId": inst_id})
+
+    def cancel_order(self, inst_id, ord_id):
+        return self._request("POST", "/api/v5/trade/cancel-order", body={"instId": inst_id, "ordId": ord_id})
+
+    def stop_order(self, inst_id, side, trigger, client_id):
+        return self._request("POST", "/api/v5/trade/order-algo", body={
+            "instId": inst_id, "tdMode": "isolated", "posSide": "net", "side": side,
+            "ordType": "conditional", "closeFraction": "1", "reduceOnly": True,
+            "slTriggerPx": trigger, "slOrdPx": "-1", "slTriggerPxType": "last",
+            "algoClOrdId": client_id,
+        })
+
+    def algo_detail(self, client_id, algo_id=None):
+        params = {"algoId": algo_id} if algo_id else {"algoClOrdId": client_id}
+        rows = self._request("GET", "/api/v5/trade/order-algo", params=params)
+        if not rows:
+            raise RuntimeError("empty algo lookup")
+        return rows[0]
+
+    def cancel_algo(self, inst_id, algo_id):
+        return self._request("POST", "/api/v5/trade/cancel-algos",
+                             body=[{"instId": inst_id, "algoId": algo_id}])
+
     def instruments(self, inst_type="SWAP"):
         return self._request("GET", "/api/v5/public/instruments", params={"instType": inst_type})
 
@@ -276,7 +343,7 @@ class DemoClient:
         })
 
     def order(self, inst_id, side, sz, td_mode="isolated", reduce_only=False,
-              quick_mgn_type=None, pos_side=None, client_order_id=None):
+              quick_mgn_type=None, pos_side=None, client_order_id=None, exp_time=None):
         body = {"instId": inst_id, "tdMode": td_mode, "side": side, "ordType": "market", "sz": str(sz)}
         if client_order_id:
             body["clOrdId"] = client_order_id
@@ -285,7 +352,7 @@ class DemoClient:
             body["quickMgnType"] = quick_mgn_type
         if pos_side in {"long", "short"}:
             body["posSide"] = pos_side
-        return self._request("POST", "/api/v5/trade/order", body=body)
+        return self._request("POST", "/api/v5/trade/order", body=body, exp_time=exp_time)
 
 def main():
     ap = argparse.ArgumentParser()

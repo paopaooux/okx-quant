@@ -1,5 +1,6 @@
 import copy
 import json
+from collections import defaultdict
 
 import pandas as pd
 import pytest
@@ -142,7 +143,19 @@ class FakeClient:
         return dict(state=self.detail_state, avgPx="100", accFillSz="1")
 
     def balance(self):
-        return [{"totalEq": "1000"}]
+        return [{"totalEq": "1000", "details": [{"ccy": "USDT", "cashBal": "1000", "availBal": "1000"}]}]
+
+    def stop_order(self, *args):
+        return [{"algoId": "stop123"}]
+
+    def algo_detail(self, *args):
+        return {"algoId": "stop123", "state": "live"}
+
+    def cancel_algo(self, *args):
+        return [{"sCode": "0"}]
+
+    def pending_orders(self, *args):
+        return []
 
     def ensure_unleveraged(self, inst):
         pass
@@ -163,7 +176,8 @@ def loop(monkeypatch):
     monkeypatch.setattr(live, "save_state", lambda s: None)
     monkeypatch.setattr(live, "save_balance", lambda rows: None)
     monkeypatch.setattr(live, "save_strategy_snapshots", lambda rows: None)
-    monkeypatch.setattr(live, "contract_specs", lambda client: {})
+    monkeypatch.setattr(live, "contract_specs", lambda client: defaultdict(lambda: {
+        "ctVal": "1", "ctValCcy": "USDT", "lotSz": "1", "minSz": "1", "tickSz": ".01"}))
     monkeypatch.setattr(live, "size_for_signal", lambda *args, **kwargs: "1")
     monkeypatch.setattr(live, "remote_positions", lambda client: {})
     return FakeClient(), now
@@ -324,12 +338,12 @@ def test_leverage_change_requires_exchange_readback(final_lever):
     assert [c[0] for c in calls] == ["GET", "POST", "GET"]
 
 
-def test_dynamic_size_rounds_up_except_final_slot():
+def test_dynamic_size_never_rounds_above_slot_budget():
     from scripts.live import auto_demo as live
     class Client: pass
     sig = {"inst_id": "AMD-USDT-SWAP", "asset_type": "stock"}
     spec = {"ctVal": "1", "ctValCcy": "AMD", "lotSz": "0.01", "minSz": "0.01"}
-    assert live.size_for_signal(Client(), sig, 484.0, "71.4", {sig["inst_id"]: spec}) == "0.03"
+    assert live.size_for_signal(Client(), sig, 484.0, "71.4", {sig["inst_id"]: spec}) == "0.02"
     assert live.size_for_signal(Client(), sig, 484.0, "71.4", {sig["inst_id"]: spec}, round_up=False) == "0.02"
 
 
