@@ -1,0 +1,13 @@
+[Unit]
+Description=Dedicated Mihomo proxy for OKX market data downloads
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/root/clashctl/bin/mihomo -d /root/clashctl/okx-download -f /root/clashctl/okx-download/config.json
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
