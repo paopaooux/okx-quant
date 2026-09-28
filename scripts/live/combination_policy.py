@@ -31,7 +31,6 @@ class CombinationPolicy:
 POLICY = CombinationPolicy()
 BAR_MS = 15 * 60 * 1000
 
-
 # Verified aliases only; never infer the underlying from a ticker substring.
 STOCK_UNDERLYINGS = {
     "SKUU": "SK_HYNIX", "SKDD": "SK_HYNIX",
@@ -63,7 +62,10 @@ def entry_metadata(signal):
                 pd.to_datetime(signal["bar"] + (POLICY.crypto_horizon_bars + 1) * BAR_MS, unit="ms", utc=True))
     return dict(policy_version=POLICY.version, take_width=0. if stock else signal["width"],
                 deadline_ts=deadline.isoformat(), resolve_ts=signal.get("resolve_ts"),
-                event_ts=signal.get("event_ts"), opened_bar=signal["bar"])
+                event_ts=signal.get("event_ts"), opened_bar=signal["bar"],
+                reference_market=signal.get("reference_market"),
+                calendar_policy_version=signal.get("calendar_policy_version"),
+                anchor_close_ts=signal.get("anchor_close_ts"))
 
 
 def migrate_policy_state(state, now):
@@ -89,6 +91,14 @@ def migrate_policy_state(state, now):
     return state
 
 
+def stock_entry_time_valid(signal, now):
+    try:
+        opening = pd.Timestamp(signal["resolve_ts"])
+        return pd.notna(opening) and opening.tzinfo is not None and now < opening
+    except (KeyError, ValueError, TypeError):
+        return False
+
+
 def entry_rejection(state, signal, now):
     if signal.get("management_only") or signal.get("side") not in {"long", "short"}:
         return "management_only_or_flat"
@@ -99,6 +109,8 @@ def entry_rejection(state, signal, now):
     if len(active) >= POLICY.shared_slots:
         return "shared_capacity"
     if signal["asset_type"] == "stock":
+        if not stock_entry_time_valid(signal, now):
+            return "cash_session_started_or_unknown"
         underlying = stock_underlying(signal["inst_id"])
         if any(stock_underlying(p["inst_id"]) == underlying for p in active.values()):
             return "same_underlying"

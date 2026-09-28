@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from strategies.trade_metrics import METRIC_NOTE
 from strategies.stocks.config import Config
-from strategies.stocks.market import data
+from strategies.stocks.market import data, reference
 from strategies.stocks.market.universe_tech import TECH
 from strategies.stocks.research import backtest, events, portfolio
 from strategies.stocks.research.stock_categories import classify_universe, validate_categories
@@ -31,6 +31,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--data-dir", default=os.environ.get("STOCK_ALPHA_DATA_DIR", "data/stocks_swap"))
     parser.add_argument("--result-dir", default=os.environ.get("STOCK_ALPHA_RESULT_DIR", "results/stocks_offhours_research"))
     parser.add_argument("--pool", choices=["all", "tech"], default="all")
+    parser.add_argument("--calendar-mode", choices=["reference", "legacy-us"], default="reference",
+                        help="Use listing-market calendars; legacy-us is only for historical comparisons")
     parser.add_argument("--category", default="all", help="category to isolate; all reports every category")
     parser.add_argument("--test-start", default="2026-08-01")
     parser.add_argument("--dislocation-bps", type=float, default=600.0)
@@ -62,7 +64,10 @@ def main() -> int:
         slippage_bps=args.slippage_bps,
         dislocation_bps=args.dislocation_bps,
     )
-    raw = events.off_hours_dislocation(frames, cfg)
+    raw = (reference.stock_events(frames, cfg) if args.calendar_mode == "reference"
+           else events.off_hours_dislocation(frames, cfg))
+    if raw.empty:
+        raise ValueError("No eligible off-hours events in the selected calendar/data window")
     indexed = universe.set_index("instId")
     tickers = indexed.ticker.astype(str)
     raw = raw.assign(
@@ -72,6 +77,8 @@ def main() -> int:
     if args.pool == "tech":
         raw = raw.loc[raw.ticker.isin(TECH)].copy()
     selected_universe = universe if args.pool == "all" else universe[universe.ticker.isin(TECH)]
+    if args.calendar_mode == "reference":
+        selected_universe = selected_universe[selected_universe.instId.map(reference.reference_market).notna()]
     universe_counts = selected_universe.groupby("category").ticker.nunique().to_dict()
     if args.volume_ratio > 0:
         raw = raw.loc[raw.volume_ratio.fillna(0.0) >= args.volume_ratio].copy()
@@ -141,6 +148,8 @@ def main() -> int:
         "trade_metrics_note": METRIC_NOTE,
         "data_dir": str(data_dir),
         "pool": args.pool,
+        "calendar_mode": args.calendar_mode,
+        "calendar_policy_version": reference.VERSION if args.calendar_mode == "reference" else "legacy_us",
         "category": args.category,
         "test_start_utc": str(test_start),
         "dislocation_bps": args.dislocation_bps,

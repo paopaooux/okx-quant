@@ -100,7 +100,7 @@ def estimate_beta(
 
 
 def _trailing_offhours_volume(frame: pd.DataFrame, until: pd.Timestamp,
-                              lookback_days: float = 10.0) -> float:
+                              lookback_days: float = 10.0, reference_market: str | None = None) -> float:
     """休市时段的常态成交额中位数，作为放量的比较基准。
 
     必须只跟休市时段比：现货时段的成交额高一个数量级，拿它当基准
@@ -110,7 +110,11 @@ def _trailing_offhours_volume(frame: pd.DataFrame, until: pd.Timestamp,
     recent = frame.loc[(frame.index > start) & (frame.index <= until)]
     if recent.empty:
         return float("nan")
-    state = sessions.market_state(recent.index)
+    if reference_market:
+        from ..market.reference import market_state
+        state = market_state(recent.index, reference_market)
+    else:
+        state = sessions.market_state(recent.index)
     off = recent.loc[state.eq("closed").to_numpy(), "volume_quote"]
     if len(off) < 20:
         return float("nan")
@@ -125,8 +129,11 @@ def off_hours_dislocation(
     frames: dict[str, pd.DataFrame], config: Config,
     benchmark: pd.DataFrame | None = None,
     windows: pd.DataFrame | None = None,
+    reference_market: str | None = None,
 ) -> pd.DataFrame:
-    """底层休市期间，代币相对现货收盘锚点的偏离。
+    """参考市场休市期间，合约相对该市场收盘时刻自身价格的偏离。
+
+    锚点来自合约行情，不是独立的现货报价；不能直接解释为现货溢价。
 
     每个休市窗口每个标的最多触发一次（首次越过阈值），这样一段
     持续的漂移不会被切成几十个互相重叠的"独立"事件。
@@ -167,7 +174,7 @@ def off_hours_dislocation(
             if hours_left < 1.0:
                 continue
             dev = float(deviation.loc[event_ts])
-            baseline = _trailing_offhours_volume(frame, close_ts)
+            baseline = _trailing_offhours_volume(frame, close_ts, reference_market=reference_market)
             burst = _window_slice(frame, close_ts, event_ts)["volume_quote"]
             volume_ratio = (
                 float(burst.median() / baseline)

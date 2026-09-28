@@ -30,11 +30,10 @@ from scripts.live.execution_risk import (
     recover_missing_exit,
 )
 from strategies.stocks.market import data as stock_data
-from strategies.stocks.market import sessions as stock_sessions
+from strategies.stocks.market import reference as stock_reference
 from strategies.stocks.config import Config as StockConfig
-from strategies.stocks.research import events as stock_events
 from scripts.live.combination_policy import (
-    POLICY, entry_metadata, entry_rejection, exit_reason, migrate_policy_state, stock_instruments,
+    POLICY, entry_metadata, entry_rejection, exit_reason, migrate_policy_state, stock_instruments, stock_entry_time_valid,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -523,10 +522,11 @@ def build_stock_signals(now: pd.Timestamp) -> dict[str, dict]:
             print(f"stock feed unavailable/stale: {STOCK_STATUS}", flush=True)
             _last_stock_feed_warning = time.time()
         return {}
-    cache_key = status.get("updated_at")
+    cache_key = (status.get("updated_at"), stock_reference.VERSION)
     if cache_key == _stock_signal_cache_key:
         return {sym: sig for sym, sig in _stock_signal_cache.items()
-                if now - pd.Timestamp(sig["event_ts"]) <= pd.Timedelta(seconds=STOCK_DATA_MAX_AGE)}
+                if now - pd.Timestamp(sig["event_ts"]) <= pd.Timedelta(seconds=STOCK_DATA_MAX_AGE)
+                and stock_entry_time_valid(sig, now)}
     try:
         universe_path = STOCK_DATA / "universe.csv"
         if not universe_path.exists():
@@ -541,11 +541,9 @@ def build_stock_signals(now: pd.Timestamp) -> dict[str, dict]:
                   now - frame.index[-1] <= pd.Timedelta(seconds=STOCK_DATA_MAX_AGE)}
         # Calendar look-ahead is known in advance; prices are strictly clipped
         # to now. Include the next cash open across weekends and holidays.
-        windows = stock_sessions.closed_windows(now - pd.Timedelta(days=8), now + pd.Timedelta(days=8))
-        windows = windows.loc[(windows.close_ts < now) & (windows.open_ts > now)]
         cfg = StockConfig(dislocation_bps=POLICY.stock_trigger_bps, data_dir=str(STOCK_DATA),
                           result_dir=str(ROOT / "results" / "stocks_swap"))
-        events = stock_events.off_hours_dislocation(frames, cfg, windows=windows)
+        events = stock_reference.stock_events(frames, cfg, now=now)
         if events.empty:
             _stock_signal_cache_key, _stock_signal_cache = cache_key, {}
             return {}
@@ -568,6 +566,9 @@ def build_stock_signals(now: pd.Timestamp) -> dict[str, dict]:
                 "event_ts": event_ts.isoformat(),
                 "ticker": ticker, "resolve_ts": pd.Timestamp(row.resolve_ts).isoformat(),
                 "observe_move_bps": float(abs(row.deviation) * 1e4),
+                "reference_market": row.reference_market,
+                "calendar_policy_version": row.calendar_policy_version,
+                "anchor_close_ts": pd.Timestamp(row.anchor_close_ts).isoformat(),
             }
         _stock_signal_cache_key, _stock_signal_cache = cache_key, out
         return out
@@ -881,6 +882,8 @@ def run_once(client: DemoClient, state: dict, allow_orders: bool, *, prepared_si
             if not fresh_bar(quote[1], max_age=TICKER_MAX_AGE):
                 continue
             tickers[sym] = quote
+            if sig["asset_type"] == "stock" and not stock_entry_time_valid(sig, pd.Timestamp.now(tz="UTC")):
+                continue
             size = size_for_signal(client, sig, quote[0], sizing_eq, specs, budget=remaining_budget)
             if not size:
                 continue

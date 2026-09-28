@@ -87,7 +87,8 @@ def test_legacy_positions_not_tightened_and_migration_day_capped():
     assert exit_reason(pos, 96., NOW) is None
     assert exit_reason(pos, 106., NOW) == "target"
     assert entry_rejection(s, signal("NEW"), NOW) == "stock_daily_limit"
-    assert entry_rejection(s, signal("NEW"), NOW + pd.Timedelta(days=1)) is None
+    tomorrow = NOW + pd.Timedelta(days=1)
+    assert entry_rejection(s, signal("NEW", now=tomorrow), tomorrow) is None
 
 
 def test_stock_cap_and_shared_pool_count_pending_orders():
@@ -103,7 +104,8 @@ def test_daily_counter_survives_json_restart_and_resets_utc_day():
     s["stock_entries_by_day"]["2026-09-07"] = 2
     s = json.loads(json.dumps(s))
     assert entry_rejection(s, signal(), NOW) == "stock_daily_limit"
-    assert entry_rejection(s, signal(), pd.Timestamp("2026-09-08T00:00:00Z")) is None
+    tomorrow = pd.Timestamp("2026-09-08T00:00:00Z")
+    assert entry_rejection(s, signal(now=tomorrow), tomorrow) is None
 
 
 def test_management_signal_never_reopens():
@@ -256,13 +258,15 @@ def test_stock_signal_uses_600bp_all_pool_and_holiday_open(tmp_path, monkeypatch
     frame = pd.DataFrame({"close": [100., 106., 200., 300.]}, index=idx)
     monkeypatch.setattr(live.stock_data, "load_panel", lambda ids, *args: {ids[0]: frame})
     monkeypatch.setattr(live.stock_data, "to_bar_end", lambda frames, bar: frames)
-    def detect(frames, cfg, windows):
+    monkeypatch.setattr(live.stock_reference, "reference_market", lambda _: "XNYS")
+    def detect(frames, cfg, windows, **kwargs):
         assert cfg.dislocation_bps == 600
         assert frames["TEST-USDT-SWAP"].index.max() == NOW
         assert windows.open_ts.iloc[0] == pd.Timestamp("2026-09-08T13:30:00Z")
         return pd.DataFrame([dict(inst_id="TEST-USDT-SWAP", event_ts=NOW, side=-1,
-                                  resolve_ts=windows.open_ts.iloc[0], deviation=.06)])
-    monkeypatch.setattr(live.stock_events, "off_hours_dislocation", detect)
+                                  resolve_ts=windows.open_ts.iloc[0], deviation=.06,
+                                  anchor_close_ts=windows.close_ts.iloc[0])])
+    monkeypatch.setattr("strategies.stocks.research.events.off_hours_dislocation", detect)
     sig = live.build_stock_signals(NOW)["TEST-USDT-SWAP"]
     assert sig["side"] == "short" and sig["width"] == .03
     assert sig["close"] == 106 and sig["ticker"] == "NOT_TECH"
