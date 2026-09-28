@@ -53,7 +53,7 @@ services:
       # Use the working account proxy unless a separate data proxy is configured.
       OKX_DATA_PROXY_URL: ${OKX_DATA_PROXY_URL:-${OKX_PROXY_URL:-http://127.0.0.1:7890}}
       AUTO_STOCK_DATA: /app/data/stocks_swap
-      STOCK_CANDLE_INTERVAL: "300"
+      STOCK_CANDLE_INTERVAL: "60"
       STOCK_HISTORY_DAYS: "18"
       OKX_CRYPTO_HISTORY_DAYS: "30"
       OKX_CRYPTO_INTERVAL: "60"

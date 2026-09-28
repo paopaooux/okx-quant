@@ -32,6 +32,18 @@ POLICY = CombinationPolicy()
 BAR_MS = 15 * 60 * 1000
 
 
+# Verified aliases only; never infer the underlying from a ticker substring.
+STOCK_UNDERLYINGS = {
+    "SKUU": "SK_HYNIX", "SKDD": "SK_HYNIX",
+    "SKHY": "SK_HYNIX", "SKHYNIX": "SK_HYNIX", "CSOPSKHYNIX2L": "SK_HYNIX",
+}
+
+
+def stock_underlying(inst_id):
+    ticker = inst_id.removesuffix("-USDT-SWAP")
+    return STOCK_UNDERLYINGS.get(ticker, ticker)
+
+
 def stock_instruments(universe):
     return sorted(universe.instId.dropna().astype(str).unique())
 
@@ -87,6 +99,9 @@ def entry_rejection(state, signal, now):
     if len(active) >= POLICY.shared_slots:
         return "shared_capacity"
     if signal["asset_type"] == "stock":
+        underlying = stock_underlying(signal["inst_id"])
+        if any(stock_underlying(p["inst_id"]) == underlying for p in active.values()):
+            return "same_underlying"
         if sum(p.get("asset_type") == "stock" for p in active.values()) >= POLICY.stock_slots:
             return "stock_capacity"
         used = state.get("stock_entries_by_day", {}).get(str(now.date()), 0)

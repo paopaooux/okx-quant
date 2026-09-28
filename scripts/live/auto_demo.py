@@ -389,10 +389,15 @@ def entry_budget(balance, state, specs, tickers):
     usdt = next((d for d in (balance[0].get("details", []) if balance else [])
                  if d.get("ccy") == "USDT"), {})
     available = [_decimal(usdt[k]) for k in ("availEq", "availBal") if usdt.get(k) not in (None, "")]
-    equity = _decimal(usdt.get("cashBal"))
+    # USDT equity includes isolated collateral; cashBal does not. Do not size
+    # against other currencies or reinvest unrealized profits.
+    if usdt.get("eq") not in (None, ""):
+        equity = _decimal(usdt["eq"]) - max(Decimal(0), _decimal(usdt.get("upl")))
+    else:
+        equity = _decimal(usdt.get("cashBal"))
     if not available or equity <= 0:
         return Decimal(0), Decimal(0)
-    used = Decimal(0)
+    reservations = {}
     for p in list(state["positions"].values()) + list(state.get("pending_entries", {}).values()):
         spec = specs.get(p["inst_id"])
         if not spec:
@@ -401,7 +406,12 @@ def entry_budget(balance, state, specs, tickers):
         value = max(contract_value(spec, mark), contract_value(spec, p["entry_px"]))
         if value <= 0:
             return equity, Decimal(0)
-        used += max(value * _decimal(p["size"]), _decimal(p.get("margin")))
+        # A partially filled entry can appear in both collections. Its pending
+        # size already reserves the full order, including the filled portion.
+        inst = p["inst_id"]
+        reservations[inst] = max(reservations.get(inst, Decimal(0)),
+                                 value * _decimal(p["size"]), _decimal(p.get("margin")))
+    used = sum(reservations.values(), Decimal(0))
     reserve = equity * _decimal(CAPITAL_BUFFER)
     return equity, max(Decimal(0), min(equity - used, min(available)) - reserve)
 

@@ -20,12 +20,12 @@ from scripts.live.combination_policy import stock_instruments
 ROOT = Path(__file__).resolve().parents[2]
 DATA = Path(os.environ.get("AUTO_STOCK_DATA", ROOT / "data" / "stocks_swap"))
 UNIVERSE = Path(os.environ.get("AUTO_STOCK_UNIVERSE", DATA / "universe.csv"))
-INTERVAL = max(60, int(os.environ.get("STOCK_CANDLE_INTERVAL", "300")))
+INTERVAL = max(60, int(os.environ.get("STOCK_CANDLE_INTERVAL", "60")))
 HISTORY_DAYS = max(18, int(os.environ.get("STOCK_HISTORY_DAYS", "18")))
 STATUS = Path(os.environ.get("AUTO_STOCK_STATUS", DATA / "data_status.json"))
 
 
-def refresh_candles(client: OKXClient) -> int:
+def refresh_candles(client: OKXClient, on_progress=None) -> int:
     if not UNIVERSE.exists():
         return 0
     universe = pd.read_csv(UNIVERSE)
@@ -35,6 +35,8 @@ def refresh_candles(client: OKXClient) -> int:
         try:
             update_cache(client, inst, "5m", HISTORY_DAYS, DATA)
             count += 1
+            if on_progress and (count == 1 or count % 10 == 0):
+                on_progress(count)
         except (OKXError, OSError, ValueError) as exc:
             failures += 1
             print(f"candle {inst} refresh failed: {exc}", flush=True)
@@ -72,15 +74,26 @@ def run_once(do_candles: bool = True, status: dict | None = None) -> dict:
     status.update({"service": "okx-stock-data", "updated_at": stamp,
                    "candle_interval_s": INTERVAL})
     if do_candles:
-        try:
-            count = refresh_candles(OKXClient(timeout=20))
+        client = OKXClient(timeout=20)
+        def publish(count):
             completed = datetime.now(timezone.utc).isoformat()
             status["updated_at"] = completed
             status["candles"] = {"last_success_at": completed, "last_error": None,
-                                  "refreshed": count, "latest_bar_at": _latest_candle_ts()}
+                                 "refreshed": count, "refreshing": True}
+            _write_status(status)
+        try:
+            count = refresh_candles(client, on_progress=publish)
+            completed = datetime.now(timezone.utc).isoformat()
+            status["updated_at"] = completed
+            status["candles"] = {"last_success_at": completed, "last_error": None,
+                                  "refreshed": count, "refreshing": False,
+                                  "latest_bar_at": _latest_candle_ts()}
         except Exception as exc:  # keep the daemon alive across transient outages
             status.setdefault("candles", {}).update({"last_error": str(exc), "last_failed_at": stamp})
             print(f"candle refresh failed: {exc}", flush=True)
+        finally:
+            client.session.close()
+            status.setdefault("candles", {})["refreshing"] = False
         _write_status(status)
     print(json.dumps({"ts": stamp,
                       "candles_refreshed": status.get("candles", {}).get("refreshed", 0)
@@ -95,16 +108,17 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="refresh once and exit")
     args = parser.parse_args()
     status: dict = {}
-    next_candles = 0.0
     while True:
-        now = time.monotonic()
-        do_candles = now >= next_candles
-        if do_candles:
-            next_candles = now + INTERVAL
-        status = run_once(do_candles=do_candles, status=status)
+        status = run_once(status=status)
         if args.once:
             return
-        time.sleep(max(1.0, next_candles - time.monotonic()))
+        # Align polls just after clock boundaries instead of preserving an
+        # arbitrary startup offset relative to five-minute candle closes.
+        time.sleep(next_refresh_delay(time.time()))
+
+
+def next_refresh_delay(now):
+    return max(1.0, ((now - 2) // INTERVAL + 1) * INTERVAL + 2 - now)
 
 
 if __name__ == "__main__":

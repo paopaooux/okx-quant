@@ -119,6 +119,15 @@ def exchange_ts(value, fallback):
         return fallback
 
 
+def bill_amount(bill):
+    """Funding pnl includes isolated cash flows absent from account balChg."""
+    if str(bill.get("type")) == "8" or str(bill.get("subType")) in {"173", "174", "funding_fee"}:
+        for field in ("pnl", "posBalChg", "balChg"):
+            if bill.get(field) not in (None, ""):
+                return str(bill[field])
+    return str(bill.get("balChg") or "0")
+
+
 def save_account_data(positions, fills, bills, *, sync_state=None):
     now = datetime.now(timezone.utc).isoformat()
     with db_connect() as db:
@@ -144,8 +153,8 @@ def save_account_data(positions, fills, bills, *, sync_state=None):
                 db.execute("""INSERT OR IGNORE INTO bills
                   (bill_id,ts,bill_type,sub_type,inst_id,currency,amount,balance,raw_json)
                   VALUES (?,?,?,?,?,?,?,?,?)
-                  ON CONFLICT(bill_id) DO UPDATE SET ts=excluded.ts, raw_json=excluded.raw_json""", (bid, exchange_ts(b.get("ts"), now), b.get("type"), b.get("subType"), b.get("instId"),
-                  b.get("ccy"), b.get("balChg"), b.get("bal"), json.dumps(b, ensure_ascii=True)))
+                  ON CONFLICT(bill_id) DO UPDATE SET ts=excluded.ts, amount=excluded.amount, raw_json=excluded.raw_json""", (bid, exchange_ts(b.get("ts"), now), b.get("type"), b.get("subType"), b.get("instId"),
+                  b.get("ccy"), bill_amount(b), b.get("bal"), json.dumps(b, ensure_ascii=True)))
         if sync_state is not None:
             stream, checkpoint = sync_state
             db.execute("INSERT OR REPLACE INTO account_sync_state VALUES (?,?)",
@@ -179,7 +188,9 @@ def print_stats():
         for b in bills:
             if b["bill_type"] == "8" or b["sub_type"] in {"173", "174", "funding_fee"}:
                 total = totals.setdefault(b["currency"] or "unknown", {"pnl": 0., "fees": 0., "funding": 0.})
-                total["funding"] += float(b["amount"] or 0)
+                raw = {"type": b["bill_type"], "subType": b["sub_type"], "balChg": b["amount"],
+                       **json.loads(b["raw_json"])}
+                total["funding"] += float(bill_amount(raw))
         snap = db.execute("""SELECT COUNT(*) count, MIN(ts) first_ts, MAX(ts) last_ts,
             COUNT(DISTINCT cycle_id) cycles FROM strategy_snapshots""").fetchone()
         print(f"database: {DB_PATH}")
