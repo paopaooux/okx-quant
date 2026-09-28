@@ -4,6 +4,12 @@
 
 ## 先记住的边界
 
+2026-09-28 更新：旧 +50.28% 组合数仅保留作旧时钟/旧成交口径的复现基线，
+不是当前可执行收益预期。下一根开盘价与信号收盘价即使差别很小，也可能改变
+止损先后，不能只给旧净收益减一个固定滑点就算修复。26 组规则和容量压力
+复核见 [研究报告](stock_robustness_report_20260928.md)。偏离 8% 上限和两仓/两槽
+只保留为研究候选；延迟压力、重复检验以及加密实盘缺失特征仍阻止直接晋级。
+
 项目需要同时支持三种观察对象：单股票、单加密、股票与加密组合。单股票和单加密都要保留不同槽位/容量的结果，槽位是风险预算和并发限制，不是新的 alpha。组合的共享池也要保留 1～5 槽比较。当前生产对象是 OKX 股票和加密 `-USDT-SWAP`，单向净仓；同一合约不能同时持有多空，反向信号必须先确认平仓。
 
 当前主线代码在 `scripts/live/`、`scripts/combinations/`、`scripts/stocks/`、`scripts/analysis/crypto_slot_sweep.py` 和 `scripts/modeling/train_dir.py`。主结果在 `results/stocks*`、`results/crypto/`、`results/combinations/latest/`；不要因为历史文件被清掉就另造一套入口。

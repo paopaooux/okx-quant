@@ -88,7 +88,7 @@ def candidate_signals(frames):
     return pd.DataFrame(rows).sort_values(['entry_ts','strategy','strength','inst_id'],ascending=[True,True,False,True])
 
 
-def path_exit(frame,entry_ts,side,stop_width,take_width,deadline):
+def path_exit(frame,entry_ts,side,stop_width,take_width,deadline, *, step=STEP):
     """Next-open entry; scan only bars after entry and before timeout. Stop first.
 
     A stop through the opening gap fills at the adverse open, not the barrier.
@@ -98,7 +98,7 @@ def path_exit(frame,entry_ts,side,stop_width,take_width,deadline):
     if deadline not in frame.index:
         return None
     path=frame[(frame.index>=entry_ts)&(frame.index<deadline)]
-    expected=pd.date_range(entry_ts,deadline,freq='15min',inclusive='left')
+    expected=pd.date_range(entry_ts,deadline,freq=step,inclusive='left')
     if not path.index.equals(expected):
         return None
     stop=entry*(1-side*stop_width);target=entry*(1+side*take_width)
@@ -107,9 +107,9 @@ def path_exit(frame,entry_ts,side,stop_width,take_width,deadline):
         targeted=take_width>0 and (b.high>=target if side==1 else b.low<=target)
         if stopped:
             px=min(stop,b.open) if side==1 else max(stop,b.open)
-            return entry,float(px),ts+STEP,'stop'
+            return entry,float(px),ts+step,'stop'
         if targeted:
-            return entry,float(target),ts+STEP,'target'
+            return entry,float(target),ts+step,'target'
     return entry,float(frame.loc[deadline,'open']),deadline,'deadline'
 
 
