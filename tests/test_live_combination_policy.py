@@ -7,8 +7,9 @@ import pytest
 
 from scripts.live import auto_demo as live
 from scripts.live import stock_data_loop
+from scripts.live import combination_policy
 from scripts.live.combination_policy import (
-    POLICY, entry_metadata, entry_rejection, exit_reason, migrate_policy_state,
+    POLICY, CombinationPolicy, entry_metadata, entry_rejection, exit_reason, migrate_policy_state,
     stock_deadline, stock_instruments,
 )
 
@@ -38,16 +39,17 @@ def state(positions=None):
                 stock_entries_by_day={}, pending_entries={}, trades=0)
 
 
-def test_frozen_rules_match_original_metadata():
+def test_original_signal_rules_and_approved_two_slot_risk_budget():
     meta = json.loads(open("results/stocks_offhours_research/metadata.json").read())
     assert POLICY.stock_trigger_bps == meta["dislocation_bps"]
     assert POLICY.stock_stop_bps == meta["stop_loss_bps"]
     assert POLICY.stock_resolve_minutes == meta["resolve_offset_minutes"]
-    assert POLICY.stock_slots == meta["slots"]
+    assert POLICY.stock_slots == 2
     assert POLICY.stock_entries_per_utc_day == meta["max_per_day"]
     assert POLICY.stock_pool == meta["pool"]
     assert POLICY.stock_take_bps == 0
-    assert POLICY.shared_slots == 5 and POLICY.slot_weight == .2
+    assert POLICY.shared_slots == 2 and POLICY.slot_weight == .35
+    assert POLICY.version == "shared2_weight35_v2"
 
 
 def test_all_stock_instruments_no_tech_or_leveraged_exclusion():
@@ -91,12 +93,40 @@ def test_legacy_positions_not_tightened_and_migration_day_capped():
     assert entry_rejection(s, signal("NEW", now=tomorrow), tomorrow) is None
 
 
-def test_stock_cap_and_shared_pool_count_pending_orders():
-    s = state({str(i): position(str(i)) for i in range(3)})
-    assert entry_rejection(s, signal("NEW"), NOW) == "stock_capacity"
+@pytest.mark.parametrize("held_asset,pending_asset", [
+    ("stock", "stock"), ("stock", "crypto"), ("crypto", "stock"), ("crypto", "crypto")])
+def test_two_shared_slots_count_both_assets_and_pending_orders(held_asset, pending_asset):
+    p = position("HELD")
+    p["asset_type"] = held_asset
+    s = state({"held": p})
     assert entry_rejection(s, signal("BTC", "crypto"), NOW) is None
-    s["pending_entries"] = {"x": signal("BTC", "crypto"), "y": signal("ETH", "crypto")}
+    s["pending_entries"] = {"x": signal("PENDING", pending_asset)}
     assert entry_rejection(s, signal("ADA", "crypto"), NOW) == "shared_capacity"
+    assert entry_rejection(s, signal("NEW", "stock"), NOW) == "shared_capacity"
+
+
+def test_policy_migration_preserves_existing_over_capacity_positions():
+    positions = {str(i): position(str(i)) for i in range(3)}
+    for p in positions.values():
+        p["policy_version"] = "original_combo_v1"
+    original = copy.deepcopy(positions)
+    s = state(positions)
+    s.update(policy_version="original_combo_v1", trades=10)
+    s["stock_entries_by_day"][str(NOW.date())] = 1
+    migrate_policy_state(s, NOW)
+    assert s["policy_version"] == POLICY.version
+    assert s["positions"] == original
+    assert s["stock_entries_by_day"][str(NOW.date())] == 1
+    assert entry_rejection(s, signal("NEW", "crypto"), NOW) == "shared_capacity"
+    s["positions"].pop("0")
+    assert entry_rejection(s, signal("NEW", "crypto"), NOW) == "shared_capacity"
+    s["positions"].pop("1")
+    assert entry_rejection(s, signal("NEW", "crypto"), NOW) is None
+
+
+def test_default_allocation_matches_live_policy():
+    assert live.MAX_POSITIONS == POLICY.shared_slots == 2
+    assert live.SLOT_WEIGHT == POLICY.slot_weight == .35
 
 
 def test_daily_counter_survives_json_restart_and_resets_utc_day():
@@ -245,6 +275,13 @@ def test_config_drift_is_rejected(monkeypatch):
         live.validate_combination_config()
 
 
+@pytest.mark.parametrize("setting,value", [("MAX_POSITIONS", 5), ("SLOT_WEIGHT", .2)])
+def test_old_allocation_overrides_fail_closed(monkeypatch, setting, value):
+    monkeypatch.setattr(live, setting, value)
+    with pytest.raises(RuntimeError, match="differs"):
+        live.validate_combination_config()
+
+
 def test_stock_signal_uses_600bp_all_pool_and_holiday_open(tmp_path, monkeypatch):
     universe = pd.DataFrame({"instId": ["TEST-USDT-SWAP"], "ticker": ["NOT_TECH"]})
     universe.to_csv(tmp_path / "universe.csv", index=False)
@@ -286,7 +323,9 @@ def test_client_order_id_is_sent_and_lookup_supported():
     assert calls[-1][2]["params"] == {"instId": "TEST-USDT-SWAP", "clOrdId": "unique123"}
 
 
-def test_original_299_trade_schedule_obeys_live_admission_rules():
+def test_original_299_trade_schedule_obeys_archived_policy(monkeypatch):
+    monkeypatch.setattr(combination_policy, "POLICY", CombinationPolicy(
+        version="original_combo_v1", stock_slots=3, shared_slots=5, slot_weight=.2))
     trades = pd.read_csv("results/combinations/latest/combined_trades.csv")
     for col in ("entry_ts", "exit_ts"):
         trades[col] = pd.to_datetime(trades[col], utc=True)
@@ -347,8 +386,8 @@ def test_dynamic_size_never_rounds_above_slot_budget():
     class Client: pass
     sig = {"inst_id": "AMD-USDT-SWAP", "asset_type": "stock"}
     spec = {"ctVal": "1", "ctValCcy": "AMD", "lotSz": "0.01", "minSz": "0.01"}
-    assert live.size_for_signal(Client(), sig, 484.0, "71.4", {sig["inst_id"]: spec}) == "0.02"
-    assert live.size_for_signal(Client(), sig, 484.0, "71.4", {sig["inst_id"]: spec}, round_up=False) == "0.02"
+    assert live.size_for_signal(Client(), sig, 484.0, "71.4", {sig["inst_id"]: spec}) == "0.05"
+    assert live.size_for_signal(Client(), sig, 484.0, "71.4", {sig["inst_id"]: spec}, round_up=False) == "0.05"
 
 
 def test_leverage_already_one_does_not_write():

@@ -180,7 +180,9 @@ def test_stop_tick_rounding(side, expected):
     assert risk.stop_price(p, {"tickSz": ".1"}) == expected
 
 
-def test_five_slots_never_exceed_cash_even_with_coarse_lots():
+def test_five_slots_never_exceed_cash_even_with_coarse_lots(monkeypatch):
+    # Retain the original five-slot rounding regression independently of policy.
+    monkeypatch.setattr(live, "SLOT_WEIGHT", .2)
     specs = {str(i): {"ctVal": "1", "ctValCcy": "USDT", "lotSz": "1", "minSz": "1"} for i in range(5)}
     balance = [{"details": [{"ccy": "USDT", "cashBal": "11", "availBal": "11"}]}]
     s = state()

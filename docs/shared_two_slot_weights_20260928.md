@@ -155,9 +155,15 @@ production recommendation. There is insufficient evidence to call 35-40% safe
 or superior merely because their retrospective returns are larger. None of the
 weights passed a requirement that every covered funding/delay case be profitable.
 
-This comparison assumes the shared capacity is two. The current source policy
-still declares five shared slots and 20%; these results must not be implemented
-by changing only the weight while leaving the five-slot policy in place.
+This comparison assumes the shared capacity is two. At the time of this
+research, the source policy still declared five shared slots and 20%; these
+results must not be implemented by changing only the weight while leaving
+the five-slot policy in place.
+
+Subsequently, the user explicitly selected two shared slots with 35% per entry.
+That allocation was deployed on September 28 at 10:06:33 UTC; see
+[the deployment record](live_shared2_weight35_20260928.md). This later risk-budget
+decision does not change the research results, limitations or original protocol.
 
 ## Artifacts And Validation
 

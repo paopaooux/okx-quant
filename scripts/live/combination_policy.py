@@ -9,17 +9,17 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class CombinationPolicy:
-    version: str = "original_combo_v1"
+    version: str = "shared2_weight35_v2"
     stock_pool: str = "all"
     stock_trigger_bps: float = 600.
     stock_stop_bps: float = 300.
     stock_take_bps: float = 0.
     stock_resolve_minutes: int = 60
     stock_max_hours: int = 30
-    stock_slots: int = 3
+    stock_slots: int = 2
     stock_entries_per_utc_day: int = 2
-    shared_slots: int = 5
-    slot_weight: float = .2
+    shared_slots: int = 2
+    slot_weight: float = .35
     crypto_config: str = "c"
     crypto_tail: float = .01
     crypto_horizon_bars: int = 48

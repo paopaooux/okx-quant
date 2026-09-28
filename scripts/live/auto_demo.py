@@ -62,14 +62,13 @@ MAX_DATA_AGE = int(os.environ.get("AUTO_MAX_DATA_AGE", "1800"))
 METRICS_MAX_AGE = MAX_DATA_AGE + BAR_MS // 1000  # build.py deliberately shifts metrics one bar.
 TICKER_MAX_AGE = min(30, MAX_DATA_AGE)
 STATE_PATH = Path(os.environ.get("AUTO_STATE", DATA / "auto_demo_state.json"))
-# Shared five-slot pool across stock and crypto contracts. Both directions are
+# Shared two-slot pool across stock and crypto contracts. Both directions are
 # eligible, but each instrument has one net position; this is a capacity limit,
 # not a 50/50 long-short split.
-MAX_POSITIONS = max(1, int(os.environ.get("AUTO_MAX_POSITIONS", "5")))
-# The combination backtest reserves one fifth of equity per accepted trade in
-# the shared five-slot pool. A signal may reverse an instrument only after its
-# existing net position has been closed.
-SLOT_WEIGHT = float(os.environ.get("AUTO_SLOT_WEIGHT", "0.20"))
+MAX_POSITIONS = max(1, int(os.environ.get("AUTO_MAX_POSITIONS", str(POLICY.shared_slots))))
+# Each new entry targets 35% of sizing equity, subject to available margin and
+# lot rounding. Existing positions are not resized when the policy changes.
+SLOT_WEIGHT = float(os.environ.get("AUTO_SLOT_WEIGHT", str(POLICY.slot_weight)))
 DYNAMIC_SIZE = os.environ.get("AUTO_DYNAMIC_SIZE", "true").strip().lower() in {
     "1", "true", "yes", "on"
 }
